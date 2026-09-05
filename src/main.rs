@@ -420,7 +420,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             HierarchyCommand::AddChild { parent_url, .. }
             | HierarchyCommand::RemoveChild { parent_url, .. } => parent_url,
         };
-        let parent = Target::from_url(&config, parent_url)?;
+        let parent = issueflow::hierarchy::target_from_url(&config, parent_url)?;
         let transport = SdkTransport::new(&config, parent.platform)?;
         let hierarchy = issueflow::hierarchy::Hierarchy {
             transport: &transport,
@@ -431,12 +431,12 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             HierarchyCommand::Children { .. } => hierarchy.children().await,
             HierarchyCommand::AddChild { child_url, .. } => {
                 hierarchy
-                    .add_child(&Target::from_url(&config, &child_url)?)
+                    .add_child(&issueflow::hierarchy::target_from_url(&config, &child_url)?)
                     .await
             }
             HierarchyCommand::RemoveChild { child_url, .. } => {
                 hierarchy
-                    .remove_child(&Target::from_url(&config, &child_url)?)
+                    .remove_child(&issueflow::hierarchy::target_from_url(&config, &child_url)?)
                     .await
             }
         };

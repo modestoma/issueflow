@@ -1,8 +1,8 @@
 use crate::{
-    config::Platform,
+    config::{Config, Platform},
     error::{Error, Result},
     service::Service,
-    target::Target,
+    target::{Target, valid_repository},
     transport::Transport,
 };
 use http::Method;
@@ -12,6 +12,58 @@ use std::collections::{BTreeSet, VecDeque};
 pub struct Hierarchy<'a> {
     pub transport: &'a dyn Transport,
     pub parent: Target,
+}
+
+pub fn target_from_url(config: &Config, input: &str) -> Result<Target> {
+    if let Ok(target) = Target::from_url(config, input) {
+        return Ok(target);
+    }
+    let url =
+        url::Url::parse(input).map_err(|_| Error::new("input", "Invalid hierarchy item URL"))?;
+    let base = config.gitlab_url.as_ref().ok_or_else(|| {
+        Error::new(
+            "configuration",
+            "GitLab hierarchy requires ISSUEFLOW_GITLAB_URL",
+        )
+    })?;
+    if url.scheme() != "https"
+        || url.origin() != base.origin()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::new(
+            "input",
+            "Hierarchy item URL does not match the configured GitLab host",
+        ));
+    }
+    let path = url.path().strip_prefix(base.path()).ok_or_else(|| {
+        Error::new(
+            "input",
+            "Hierarchy item URL does not match the configured GitLab base path",
+        )
+    })?;
+    let (repository, number) = path
+        .trim_end_matches('/')
+        .rsplit_once("/-/work_items/")
+        .ok_or_else(|| {
+            Error::new(
+                "input",
+                "Expected a GitHub issue or GitLab issue/work-item URL",
+            )
+        })?;
+    if !valid_repository(repository, Platform::Gitlab) {
+        return Err(Error::new("input", "Invalid GitLab work-item project path"));
+    }
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| Error::new("input", "Invalid GitLab work-item iid"))?;
+    Ok(Target {
+        platform: Platform::Gitlab,
+        repository: repository.into(),
+        number: Some(number),
+    })
 }
 
 impl Hierarchy<'_> {
@@ -97,14 +149,20 @@ impl Hierarchy<'_> {
         Ok(Value::Array(service.pages(&self.root()?).await?))
     }
     async fn gitlab_item(&self, after: Option<&str>) -> Result<Value> {
-        let iid = self
-            .parent
+        Self::gitlab_item_for(self.transport, &self.parent, after).await
+    }
+    async fn gitlab_item_for(
+        transport: &dyn Transport,
+        target: &Target,
+        after: Option<&str>,
+    ) -> Result<Value> {
+        let iid = target
             .number
             .ok_or_else(|| Error::new("input", "GitLab work item URL requires an iid"))?
             .to_string();
-        let response = self.transport.request(Method::POST, "graphql", Some(json!({
+        let response = transport.request(Method::POST, "graphql", Some(json!({
             "query":"query($fullPath:ID!,$iid:String!,$after:String){namespace(fullPath:$fullPath){workItem(iid:$iid){id iid title webUrl workItemType{name} widgets{type ... on WorkItemWidgetHierarchy{parent{id iid title webUrl workItemType{name}} children(first:100,after:$after){nodes{id iid title webUrl workItemType{name}} pageInfo{hasNextPage endCursor}}}}}}}",
-            "variables":{"fullPath":self.parent.repository,"iid":iid,"after":after}
+            "variables":{"fullPath":target.repository,"iid":iid,"after":after}
         }))).await?;
         if response
             .get("errors")
@@ -182,7 +240,9 @@ impl Hierarchy<'_> {
         Ok(())
     }
     pub async fn add_child(&self, child: &Target) -> Result<Value> {
-        self.github()?;
+        if self.parent.platform == Platform::Gitlab {
+            return self.set_gitlab_parent(child, true).await;
+        }
         if child.platform != Platform::Github || child == &self.parent {
             return Err(Error::new(
                 "input",
@@ -231,7 +291,9 @@ impl Hierarchy<'_> {
         Ok(json!({"changed":true,"children":verified}))
     }
     pub async fn remove_child(&self, child: &Target) -> Result<Value> {
-        self.github()?;
+        if self.parent.platform == Platform::Gitlab {
+            return self.set_gitlab_parent(child, false).await;
+        }
         if child.platform != Platform::Github {
             return Err(Error::new("input", "Child must be a GitHub issue"));
         }
@@ -275,6 +337,92 @@ impl Hierarchy<'_> {
         }
         Ok(json!({"changed":true,"children":verified}))
     }
+    async fn set_gitlab_parent(&self, child: &Target, add: bool) -> Result<Value> {
+        if child.platform != Platform::Gitlab
+            || child.repository != self.parent.repository
+            || child == &self.parent
+        {
+            return Err(Error::new(
+                "input",
+                "GitLab parent and child must be distinct work items in one project",
+            ));
+        }
+        let parent = Self::gitlab_item_for(self.transport, &self.parent, None).await?;
+        let before = Self::gitlab_item_for(self.transport, child, None).await?;
+        let parent_type = parent["workItemType"]["name"]
+            .as_str()
+            .ok_or_else(|| Error::new("response", "GitLab parent type is missing"))?;
+        let child_type = before["workItemType"]["name"]
+            .as_str()
+            .ok_or_else(|| Error::new("response", "GitLab child type is missing"))?;
+        if (parent_type, child_type) != ("Issue", "Task") {
+            return Err(Error::new(
+                "input",
+                "This project-level adapter supports only GitLab Issue to Task hierarchy",
+            ));
+        }
+        let parent_id = parent["id"]
+            .as_str()
+            .ok_or_else(|| Error::new("response", "GitLab parent id is missing"))?;
+        let child_id = before["id"]
+            .as_str()
+            .ok_or_else(|| Error::new("response", "GitLab child id is missing"))?;
+        let current_parent = hierarchy_parent(&before);
+        if add && current_parent.and_then(|item| item["id"].as_str()) == Some(parent_id)
+            || !add && current_parent.is_none()
+        {
+            return Ok(json!({"changed":false,"child":before}));
+        }
+        if add && current_parent.is_some() {
+            return Err(Error::new(
+                "conflict",
+                "GitLab child already belongs to another parent",
+            ));
+        }
+        if !add && current_parent.and_then(|item| item["id"].as_str()) != Some(parent_id) {
+            return Err(Error::new(
+                "conflict",
+                "GitLab child does not belong to the requested parent",
+            ));
+        }
+        let response = self.transport.request(Method::POST, "graphql", Some(json!({
+            "query":"mutation($input:WorkItemUpdateInput!){workItemUpdate(input:$input){workItem{id} errors}}",
+            "variables":{"input":{"id":child_id,"hierarchyWidget":{"parentId":if add { Value::String(parent_id.into()) } else { Value::Null }}}}
+        }))).await.map_err(unknown)?;
+        if response
+            .get("errors")
+            .is_some_and(|errors| !errors.as_array().is_some_and(|items| items.is_empty()))
+            || !response["data"]["workItemUpdate"]["errors"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())
+            || response["data"]["workItemUpdate"]["workItem"]["id"].as_str() != Some(child_id)
+        {
+            return Err(unknown(Error::new(
+                "graphql",
+                "GitLab hierarchy mutation was not confirmed",
+            )));
+        }
+        let after = Self::gitlab_item_for(self.transport, child, None)
+            .await
+            .map_err(unknown)?;
+        let actual = hierarchy_parent(&after).and_then(|item| item["id"].as_str());
+        if actual != if add { Some(parent_id) } else { None } {
+            return Err(unknown(Error::new(
+                "conflict",
+                "GitLab hierarchy readback differs",
+            )));
+        }
+        Ok(json!({"changed":true,"child":after}))
+    }
+}
+
+fn hierarchy_parent(item: &Value) -> Option<&Value> {
+    item["widgets"]
+        .as_array()?
+        .iter()
+        .find(|widget| widget["type"] == "HIERARCHY")?
+        .get("parent")
+        .filter(|parent| !parent.is_null())
 }
 
 fn unknown(mut error: Error) -> Error {

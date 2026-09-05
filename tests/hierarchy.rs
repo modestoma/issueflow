@@ -35,6 +35,16 @@ fn target(number: u64) -> Target {
         number: Some(number),
     }
 }
+fn gitlab_target(number: u64) -> Target {
+    Target {
+        platform: Platform::Gitlab,
+        repository: "group/repo".into(),
+        number: Some(number),
+    }
+}
+fn gitlab_item(id: u64, iid: u64, kind: &str, parent: Option<Value>) -> Value {
+    json!({"data":{"namespace":{"workItem":{"id":format!("gid://gitlab/WorkItem/{id}"),"iid":iid.to_string(),"title":kind,"webUrl":format!("https://gitlab.example/group/repo/-/work_items/{iid}"),"workItemType":{"name":kind},"widgets":[{"type":"HIERARCHY","parent":parent,"children":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}]}}}})
+}
 
 #[tokio::test]
 async fn reads_parent_and_paginated_children() {
@@ -146,4 +156,85 @@ async fn gitlab_reads_parent_and_children_with_work_item_types() {
         calls[0].2.as_ref().unwrap()["variables"]["fullPath"],
         "group/repo"
     );
+}
+
+#[tokio::test]
+async fn gitlab_adds_issue_task_parent_and_reads_back() {
+    let parent_value = json!({"id":"gid://gitlab/WorkItem/2","iid":"2","title":"Issue","webUrl":"https://gitlab.example/group/repo/-/issues/2","workItemType":{"name":"Issue"}});
+    let mock = Mock {
+        replies: Mutex::new(vec![
+            gitlab_item(2, 2, "Issue", None),
+            gitlab_item(3, 3, "Task", None),
+            json!({"data":{"workItemUpdate":{"workItem":{"id":"gid://gitlab/WorkItem/3"},"errors":[]}}}),
+            gitlab_item(3, 3, "Task", Some(parent_value)),
+        ].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: gitlab_target(2),
+    }
+    .add_child(&gitlab_target(3))
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls[2].2.as_ref().unwrap()["variables"]["input"]["id"],
+        "gid://gitlab/WorkItem/3"
+    );
+    assert_eq!(
+        calls[2].2.as_ref().unwrap()["variables"]["input"]["hierarchyWidget"]["parentId"],
+        "gid://gitlab/WorkItem/2"
+    );
+}
+
+#[tokio::test]
+async fn gitlab_removes_issue_task_parent_and_reads_back() {
+    let parent_value = json!({"id":"gid://gitlab/WorkItem/2","iid":"2","title":"Issue","webUrl":"https://gitlab.example/group/repo/-/issues/2","workItemType":{"name":"Issue"}});
+    let mock = Mock {
+        replies: Mutex::new(vec![
+            gitlab_item(2, 2, "Issue", None),
+            gitlab_item(3, 3, "Task", Some(parent_value)),
+            json!({"data":{"workItemUpdate":{"workItem":{"id":"gid://gitlab/WorkItem/3"},"errors":[]}}}),
+            gitlab_item(3, 3, "Task", None),
+        ].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: gitlab_target(2),
+    }
+    .remove_child(&gitlab_target(3))
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(
+        mock.calls.lock().unwrap()[2].2.as_ref().unwrap()["variables"]["input"]["hierarchyWidget"]
+            ["parentId"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn gitlab_rejects_issue_to_issue_without_mutation() {
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                gitlab_item(2, 2, "Issue", None),
+                gitlab_item(3, 3, "Issue", None),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Hierarchy {
+        transport: &mock,
+        parent: gitlab_target(2),
+    }
+    .add_child(&gitlab_target(3))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "input");
+    assert_eq!(mock.calls.lock().unwrap().len(), 2);
 }
