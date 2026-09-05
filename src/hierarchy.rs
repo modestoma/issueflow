@@ -27,6 +27,8 @@ pub fn target_from_url(config: &Config, input: &str) -> Result<Target> {
         )
     })?;
     if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
         || url.origin() != base.origin()
         || url.query().is_some()
         || url.fragment().is_some()

@@ -1,9 +1,14 @@
 use async_trait::async_trait;
 use http::Method;
 use issueflow::{
-    config::Platform, error::Result, hierarchy::Hierarchy, target::Target, transport::Transport,
+    config::{Config, Overrides, Platform},
+    error::Result,
+    hierarchy::{Hierarchy, target_from_url},
+    target::Target,
+    transport::Transport,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::{collections::VecDeque, sync::Mutex};
 
 struct Mock {
@@ -98,6 +103,76 @@ async fn add_child_checks_cycles_writes_once_and_reads_back() {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].1, "repos/owner/repo/issues/2/sub_issues");
     assert_eq!(writes[0].2.as_ref().unwrap()["sub_issue_id"], 30);
+}
+
+#[tokio::test]
+async fn github_remove_child_writes_once_and_reads_back() {
+    let child = issue(3, 30);
+    let mock = Mock {
+        replies: Mutex::new(vec![child.clone(), json!([child]), json!({}), json!([])].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .remove_child(&target(3))
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls[2].0, Method::DELETE);
+    assert_eq!(calls[2].1, "repos/owner/repo/issues/2/sub_issue");
+    assert_eq!(calls[2].2.as_ref().unwrap()["sub_issue_id"], 30);
+}
+
+#[tokio::test]
+async fn github_existing_and_missing_relationships_are_noops() {
+    let child = issue(3, 30);
+    let add_mock = Mock {
+        replies: Mutex::new(vec![json!([]), child.clone(), json!([child.clone()])].into()),
+        calls: Mutex::new(vec![]),
+    };
+    assert_eq!(
+        Hierarchy {
+            transport: &add_mock,
+            parent: target(2)
+        }
+        .add_child(&target(3))
+        .await
+        .unwrap()["changed"],
+        false
+    );
+    assert!(
+        add_mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+    let remove_mock = Mock {
+        replies: Mutex::new(vec![child, json!([])].into()),
+        calls: Mutex::new(vec![]),
+    };
+    assert_eq!(
+        Hierarchy {
+            transport: &remove_mock,
+            parent: target(2)
+        }
+        .remove_child(&target(3))
+        .await
+        .unwrap()["changed"],
+        false
+    );
+    assert!(
+        remove_mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
 }
 
 #[tokio::test]
@@ -237,4 +312,32 @@ async fn gitlab_rejects_issue_to_issue_without_mutation() {
     .unwrap_err();
     assert_eq!(error.code, "input");
     assert_eq!(mock.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn gitlab_work_item_url_requires_configured_host_and_base_path() {
+    let config = Config::resolve(
+        HashMap::new(),
+        HashMap::from([(
+            "ISSUEFLOW_GITLAB_URL".into(),
+            "https://gitlab.example/tools".into(),
+        )]),
+        Overrides::default(),
+    )
+    .unwrap();
+    let target = target_from_url(
+        &config,
+        "https://gitlab.example/tools/group/repo/-/work_items/3",
+    )
+    .unwrap();
+    assert_eq!(target.platform, Platform::Gitlab);
+    assert_eq!(target.repository, "group/repo");
+    assert_eq!(target.number, Some(3));
+    for invalid in [
+        "https://evil.example/tools/group/repo/-/work_items/3",
+        "https://gitlab.example/group/repo/-/work_items/3",
+        "https://user@gitlab.example/tools/group/repo/-/work_items/3",
+    ] {
+        assert!(target_from_url(&config, invalid).is_err());
+    }
 }

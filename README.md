@@ -108,7 +108,7 @@ issueflow issue remove-dependency https://github.com/owner/repo/issues/42 https:
 
 The first issue is **blocked by the second issue**. Before adding a dependency, the CLI traverses reachable blockers and checks for cycles, up to 1,000 nodes. GitHub uses the dependencies API; GitLab uses issue links. Dependencies may cross repositories but must remain on the same platform and instance. Unsupported versions or insufficient permissions produce API errors; ordinary related-to links are never presented as blocking relationships. Native GitLab blocking relationships depend on the instance license.
 
-Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Native parent-child hierarchy APIs and worktree automation are outside this version's scope. Parent/child issue URLs and branch contracts can be maintained in issue bodies.
+Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent/child hierarchy is independent of blocking and does not automatically authorize work or delivery.
 
 ## GitHub Projects
 
@@ -248,7 +248,18 @@ Merging does not invoke issue closure, delete branches, or set Project Status. V
 
 For GitLab, `pr list/show/create/update/ready/checks/merge` use the configured instance URL, nested project path, and MR iid. Creation is limited to source and target branches in the same project. `ready` removes a `Draft:` or `WIP:` title prefix. Checks return MR pipelines and the native approvals response as observed evidence; they never grant merge authorization. GitLab merge supports merge and squash, but not the GitHub-style rebase method. Protected branches, approval rules, pipeline requirements, and server policy remain authoritative.
 
-Current commands do not evaluate every repository merge policy or manage native sub-issue relationships. Review required checks using available repository evidence or the PR/MR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls), [GitLab Merge Requests API reference](https://docs.gitlab.com/api/merge_requests/).
+Current commands do not evaluate every repository merge policy. Review required checks using available repository evidence or the PR/MR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls), [GitLab Merge Requests API reference](https://docs.gitlab.com/api/merge_requests/).
+
+### Native parent and child hierarchy
+
+```sh
+issueflow hierarchy parent ISSUE_OR_WORK_ITEM_URL
+issueflow hierarchy children ISSUE_OR_WORK_ITEM_URL
+issueflow hierarchy add-child PARENT_URL CHILD_URL
+issueflow hierarchy remove-child PARENT_URL CHILD_URL
+```
+
+GitHub uses native Sub-issues REST endpoints. Adds traverse up to 1,000 descendants before writing to reject cycles, reuse an existing relationship, and read back mutations. GitLab uses the versionless Work Item GraphQL hierarchy widget through the configured instance `/api/graphql` endpoint. The project-level adapter supports the reliable `Issue -> Task` combination only: both items must be distinct and in the same project, their native Work Item types are read before mutation, an existing different parent causes a conflict, and `workItemUpdate.hierarchyWidget.parentId` is verified by rereading the child. Arbitrary `Issue -> Issue`, group Epic mapping, and hierarchy reordering are not claimed. Native hierarchy never implies a blocking dependency; keep branch contracts and blocking links explicit. [GitHub Sub-issues API](https://docs.github.com/en/rest/issues/sub-issues), [GitLab child items](https://docs.gitlab.com/user/work_items/child_items/).
 
 ### Validate parent/child branch contracts
 
