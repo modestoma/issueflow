@@ -52,6 +52,14 @@ Creation appends an operation UUID comment to the body. The output includes the 
 
 **This is not a server-side idempotency guarantee.** Concurrent use of the same UUID, incomplete visibility, removed markers, or temporary listing delays can still cause duplicates. A write timeout reports `outcome_unknown: true` and the request ID; inspect the remote state before resending. Requests are never automatically retried and redirects are not followed. An unparseable success response is also treated as an unknown write outcome.
 
+For an uncertain creation outcome, inspect the original request ID without another write:
+
+```sh
+issueflow --platform github --repository owner/repo issue recover-create --request-id UUID
+```
+
+The command scans visible open and closed issues and returns `found`, `not_visible`, or `ambiguous`, with matching issue URLs. UUID matching is normalized, so letter case does not affect lookup. `safe_to_retry` is always false: zero visible matches never proves the earlier create failed, one match should be continued by URL, and multiple matches need reconciliation. This command performs no POST, no local registry maintenance, and no automatic retries. It improves recovery visibility without claiming distributed idempotency or fixing GitHub listing delays.
+
 `--expected-updated-at` checks for stale data before writing. It is not an atomic platform compare-and-swap operation; another update can occur between the check and the write. Merge changes against the latest body.
 
 ### Labels and state
@@ -123,11 +131,25 @@ For a board using these stages, the recommended workflow mapping is:
 | Awaiting review or human acceptance | In review |
 | Accepted and delivered | Done |
 
-Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. The CLI does not create fields or options. Keep type, priority, and blocked labels independently.
+Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. Status option initialization is available explicitly through `project init-statuses`; routine status changes do not create fields or options. Keep type, priority, and blocked labels independently.
 
 Projects-backed GitHub workflows should use `project status` as the stage store instead of calling the label-based `issue transition`. `issue transition` remains label-based. For Project-backed workflows, close/reopen with `--no-workflow-labels` to change only native issue state and preserve all labels; update Project Status separately. This option also leaves resolution labels unchanged, so reconcile termination reasons explicitly when needed. Without the flag, existing close/reopen label behavior remains unchanged.
 
 **Project Status and issue state are separate.** The CLI does not send issue-close mutations when changing Status. However, GitHub Project automations can close issues or overwrite Status when items change. Inspect the Project's Workflows settings before using live status writes; disable automatic closure if it would bypass human acceptance. Moving a card does not launch Codex or authorize merging or deployment.
+
+### Project onboarding
+
+```sh
+issueflow project list --owner modestoma
+issueflow project create --owner modestoma --title 'My workflow'
+issueflow project init-statuses https://github.com/users/modestoma/projects/2
+```
+
+Use `--owner-type organization` for an organization. `list` reads all visible Projects for the explicit owner. `create` reuses a unique open Project with the exact title, rejects ambiguous/closed matches, or creates a new Project and verifies it by its returned ID/number. No mutation is automatically retried. Title lookup is best-effort reuse, not an atomic idempotency guarantee; after an unknown outcome inspect the owner's Project list before any new create attempt.
+
+`init-statuses` adds missing `Backlog`, `Ready`, `In progress`, `In review`, `Done`, and `Cancelled` options to the existing Status field. It preserves existing option IDs, names, colors and descriptions (including unused default options), rejects ambiguous or closed Projects, checks for intervening field changes, and reads back the result. Existing card values should remain attached to the same option IDs. The API updates the complete option list, so concurrent edits between the final check and write can still race; this is not a transaction. Existing workflows and view layouts are not modified; choose a Board view in GitHub when needed. Review automation settings separately before using the board.
+
+After successful readback, record the selected URL as `github_project_url` in the repository's secret-free `.issue-workflow.json` and run `workflow validate`. Do not save guessed URLs or create a new Project merely because an existing one is inaccessible. The CLI does not automatically overwrite local configuration or provision every repository; these commands are explicit onboarding actions.
 
 ### Projects authentication and failure handling
 
@@ -161,7 +183,24 @@ Example `pr.json` (UTF-8; `--file -` also accepts stdin):
 
 Push the head branch first. Head and base must be distinct branches in the same repository; fork heads are not supported in this version. Unknown JSON fields are rejected. The CLI appends `Refs <issue URL>` rather than an automatic closing keyword; do not include `Fixes` or `Closes` directives yourself if closure must wait for acceptance. PR output retains GitHub's native fields, including `html_url`, `head.sha`, and `base.ref`.
 
-`pr list` returns open PRs with complete pagination. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
+`pr list` defaults to open PRs with complete pagination; `--state closed`, `--state merged`, and `--state all` support historical lookup. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
+
+Inspect the evidence for the current PR head before requesting merge approval:
+
+```sh
+issueflow pr checks https://github.com/owner/repo/pull/8
+```
+
+The command reads paginated check runs, latest commit statuses per context, and review history, then rereads the PR to reject head/base changes during inspection. `observed_checks` is `absent`, `pending`, `failed`, `non_failing` (neutral/skipped), or `passed`. No checks is not a pass. Reviews are annotated with whether their commit matches the current head; they are historical records, not an effective approval count. Required branch/ruleset policies and human acceptance are not evaluated, and `merge_authorized` is always false. API permission failures remain errors, never empty evidence. The SHA is evidence provenance, not a persistent authorization token.
+
+Update a PR selectively or mark a Draft ready for review:
+
+```sh
+issueflow pr update https://github.com/owner/repo/pull/8 --file pr-changes.json --expected-head-sha FULL_40_CHARACTER_SHA
+issueflow pr ready https://github.com/owner/repo/pull/8 --expected-head-sha FULL_40_CHARACTER_SHA
+```
+
+Update JSON accepts only optional `title` and `body`. Omitted/null fields are preserved, blank titles and empty updates are rejected, and existing standalone `Refs https://...` lines are retained when replacing the body. No base/head retargeting is performed. Both operations reject closed PRs or stale head expectations and read back their results. This is a read-before-write check, not an atomic lock; concurrent metadata edits may still race. `ready` is a no-op if already ready and currently supports github.com only. Neither command merges or closes issues; GraphQL mutation errors may have unknown outcomes.
 
 After explicit review and merge authorization:
 
@@ -174,7 +213,61 @@ Merge requires an open, non-draft PR with the expected target and full head SHA.
 
 Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. Project-backed closure uses `--no-workflow-labels`; reopening has the same flag. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
-Current commands do not edit PR metadata, read all review/check-run details, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+
+### Validate parent/child branch contracts
+
+```sh
+issueflow workflow validate-contract --file child.json --parent-file parent.json
+```
+
+A contract is a small JSON artifact that can be kept in the issue body and materialized temporarily for validation; no local issue registry is required:
+
+```json
+{
+  "schema_version": 1,
+  "issue_url": "https://github.com/owner/repo/issues/12",
+  "parent_issue_url": "https://github.com/owner/repo/issues/10",
+  "source_branch": "feat/issue-10-parent",
+  "branch": "feat/issue-12-child",
+  "pr_target": "feat/issue-10-parent",
+  "pr_url": null
+}
+```
+
+The parent file uses the same schema with its own issue URL/branch and original target; a root uses `parent_issue_url: null`. Validation requires source and PR target to agree, distinct development/target branches, same-repository issue/PR URLs, and a child's target to equal the supplied parent's branch. A child without its parent file is not considered validated. Unknown fields are rejected. This runs offline and never loads credentials or mutates branches.
+
+The result explicitly sets `remote_verified: false`: local validation does not prove branches exist, inspect actual PR targets, grant merge permission, or validate a full ancestor graph. Read the actual PR before merging and compare its head/base with the contract. The parent still needs overall acceptance after its children deliver.
+
+## Recover interrupted workflow delivery
+
+```sh
+issueflow --no-env-file workflow inspect --file child.json --parent-file parent.json --config-file .issue-workflow.json
+issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json
+issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json --apply --expected-head-sha FULL_40_CHARACTER_SHA
+```
+
+Both `inspect` and `reconcile` are **read-only by default**. They validate the branch contract and workflow configuration, resolve an explicit PR URL or search all PR states for the contracted head/base, verify the issue reference, and inspect native issue and Project state. Multiple matching historical PRs require an explicit `pr_url`; none is reported as `no_pr`, never treated as permission to create a new PR.
+
+A merged PR is considered delivered only when its merge commit is reachable from the contracted target according to GitHub's compare API. A missing/deleted target or unreadable evidence prevents automatic completion. Returned phases include `no_pr`, `in_progress`, `in_review`, `delivery_pending`, `acceptance_pending`, `manual_review`, `reconciliation_needed`, and `complete`.
+
+Under `delivery_policy: "merged"`, verified target delivery allows closure planning. Under `acceptance_required`, the caller must explicitly pass `--accepted` only after human acceptance has been confirmed; a green check or merged PR is insufficient. Reuse an existing confirmed acceptance decision when resuming, rather than asking the user repeatedly. Configuration and these flags do not grant merge permission.
+
+Only explicit `--apply` performs missing actions, guarded by the expected PR head: add missing Project membership, set Project Status to Done, and/or close the native issue while preserving labels. The workflow configuration supplies the Project URL. Project-backed recovery removes redundant workflow-stage labels; without a Project it reconciles the workflow stage label to `workflow::已完成`. Type, priority and other unrelated labels are preserved. Missing/ambiguous Done options, archived items, terminated issues, unknown closure reasons, or unmerged PRs block writes. Terminated issues are never reopened or relabeled as completed.
+
+Evidence is refreshed before each action and after completion. Repeating a completed recovery is a no-op. The command never merges a PR, creates an issue/PR, modifies local Git state, or posts comments. Partial failures report confirmed completed steps and unknown outcomes; inspect again instead of replaying a merge or a stale plan. These checks and cross-API writes are not atomic: concurrent retargeting, force pushes, acceptance changes or Project automations still require reconciliation. PR/issue references and caller-supplied acceptance are not a distributed lock or cryptographic proof of approval.
+
+## Inspect worktree cleanup eligibility
+
+```sh
+issueflow --no-env-file workflow cleanup-check --file child.json --parent-file parent.json --config-file .issue-workflow.json --worktree /absolute/path/to/worktree
+```
+
+This command never deletes files, worktrees, or branches. It combines recovery evidence with local Git inspection and open PRs targeting the candidate branch. The exact registered worktree root, expected branch and repository remote must match. Main worktrees, locked worktrees, tracked modifications, untracked files, ignored files, incomplete remote delivery, or a local HEAD different from the reviewed PR head prevent eligibility. Ignored files include `.env` and generated `target/` output; the tool does not silently assume they are disposable. Git inspection disables optional index locks and filesystem monitor hooks.
+
+Open PRs cannot reveal unpublished child work. After separately reviewing child issues, branches and worktrees, `--confirm-no-dependent-work` records that dependency check for this invocation; it does not override any detected open dependent PR. Omission keeps the result ineligible. A completed squash/rebase delivery can still be recognized by remote merge ancestry and matching reviewed head without requiring the original head commit to be an ancestor of the target.
+
+`eligible: true` means the recorded checks passed at inspection time, not that deletion was authorized. Recheck immediately before a separately authorized cleanup, and never force-remove a worktree merely because it belongs to a closed issue. Unknown/failed Git or API evidence fails the check. Remote credentials are not printed, and no cleanup is executed by this CLI version.
 
 ## Output and errors
 
@@ -192,6 +285,34 @@ Exit codes:
 | `5` | Conflict |
 
 Raw server error bodies are not printed, to avoid accidentally exposing credentials. The HTTP status is retained in `status`. Clap command usage errors use the standard CLI help format. A GitHub `403` can also indicate secondary rate limiting and requires interpretation in context.
+
+## Workflow configuration and capability discovery
+
+```sh
+issueflow capabilities
+issueflow workflow validate --file .issue-workflow.json
+```
+
+These commands run offline before `.env` or environment configuration is loaded. `capabilities` derives its command/option tree from the installed CLI parser, so different builds can be distinguished even when their package versions match. It does not imply remote permissions.
+
+Workflow validation checks a GitHub-only, secret-free schema with `schema_version: 1`, `platform: "github"`, `host: "github.com"`, full `repository`, `remote`, `base_branch`, `timezone: "Asia/Shanghai"`, and explicit `permissions`. Optional fields include `proposer`, `verification_commands`, `manual_acceptance`, `delivery_condition`, `github_project_url`, and `branch_prefixes`. Unknown fields (including token fields) are rejected; configured commands are never executed. Validation neither changes API routing nor grants authorization. Existing API commands still use their normal explicit flags/environment configuration.
+
+`delivery_policy` is `merged` when approved merge into the contracted target completes delivery, or `acceptance_required` when deployment/device/business acceptance remains necessary. Omission defaults to `acceptance_required`. Both policies still require user merge approval. `permissions` retains independent local_commit/push flags and optional pull_request/draft_pr_mr flags; a legacy Draft permission is not promoted to general PR permission.
+
+### Delivery and closure policy
+
+| Policy | Meaning of an approved merge | When the issue may close |
+| --- | --- | --- |
+| `merged` | Delivery into this issue's contracted PR target completes the code task | After merged state and target delivery are verified, unless additional acceptance was explicitly required |
+| `acceptance_required` | Code has landed but delivery may remain incomplete | Only after the additional deployment, device, or business acceptance has been confirmed |
+
+A policy never grants merge permission. User approval applies to the specific reviewed PR/head; approving a child PR does not approve its parent. A child delivers to its parent integration branch, while the parent requires overall acceptance and delivery to the original target. Without an explicit policy, keep the conservative `acceptance_required` default; do not infer acceptance from a closed PR or green CI.
+
+For each authorized merge, finish one issue before moving to the next: verify merged state and target, evaluate its delivery condition, update Project/issue state if eligible, then read both back. If delivery remains pending, keep the issue open and state the concrete remaining check. If an API step fails, inspect actual state and retry only the missing authorized step; do not repeat the merge or claim the whole batch is complete.
+
+Project stage timing is part of the workflow: record Ready once prerequisites are satisfied, set and verify In progress **before implementation**, and enter In review only after a PR and verification are ready. Historical missing transitions are acknowledged, not backfilled by rewinding the current stage.
+
+Project URLs are validated against the supported canonical github.com user/org format without contacting the server. Credential configuration remains separate; no `.env` is needed when the process already has `ISSUEFLOW_GITHUB_TOKEN`.
 
 ## Configuration
 

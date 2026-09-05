@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, process::ExitCode};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use issueflow::config::{Config, Overrides, read_env_file};
 use issueflow::{
     error::{Error, Result},
@@ -28,6 +28,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect installed command capabilities without loading credentials
+    Capabilities,
+    /// Validate a secret-free GitHub workflow configuration (offline)
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
     /// Create, inspect and explicitly merge GitHub pull requests
     #[command(subcommand)]
     Pr(PullCommand),
@@ -46,8 +51,93 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum WorkflowCommand {
+    /// Read-only worktree cleanup eligibility; never deletes anything
+    CleanupCheck {
+        #[command(flatten)]
+        args: RecoveryArgs,
+        #[arg(long)]
+        worktree: PathBuf,
+        /// Assert no unpublished child issues/branches still depend on this branch
+        #[arg(long)]
+        confirm_no_dependent_work: bool,
+    },
+    /// Read remote delivery state and propose missing recovery steps
+    Inspect(RecoveryArgs),
+    /// Inspect by default; explicitly apply only missing eligible steps
+    Reconcile {
+        #[command(flatten)]
+        args: RecoveryArgs,
+        #[arg(long, requires = "expected_head_sha")]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        expected_head_sha: Option<String>,
+    },
+    ValidateContract {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        parent_file: Option<PathBuf>,
+    },
+    Validate {
+        #[arg(long, default_value = ".issue-workflow.json")]
+        file: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
+struct RecoveryArgs {
+    #[arg(long)]
+    file: PathBuf,
+    #[arg(long)]
+    parent_file: Option<PathBuf>,
+    #[arg(long, default_value = ".issue-workflow.json")]
+    config_file: PathBuf,
+    /// Assert human acceptance was explicitly confirmed; never inferred from CI
+    #[arg(long)]
+    accepted: bool,
+}
+
+fn command_schema(c: &clap::Command) -> Value {
+    json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
+}
+fn finish(result: Result<Value>) -> ExitCode {
+    match result {
+        Ok(v) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v).expect("JSON serialization")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{}", json!({"error":e}));
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum PullCommand {
+    /// Inspect checks and review evidence for the current PR head
+    Checks {
+        url: String,
+    },
+    Update {
+        url: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_head_sha: String,
+    },
+    Ready {
+        url: String,
+        #[arg(long)]
+        expected_head_sha: String,
+    },
     List {
+        #[arg(long, value_enum, default_value = "open")]
+        state: issueflow::pull::PullState,
         #[arg(long)]
         head: Option<String>,
         #[arg(long)]
@@ -72,8 +162,40 @@ enum PullCommand {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProjectOwner {
+    User,
+    Organization,
+}
+impl ProjectOwner {
+    fn path(self) -> &'static str {
+        match self {
+            Self::User => "users",
+            Self::Organization => "orgs",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ProjectCommand {
+    /// List Projects belonging to an explicit GitHub owner
+    List {
+        #[arg(long)]
+        owner: String,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+    },
+    /// Create a Project or reuse a unique matching title; never retries mutations
+    Create {
+        #[arg(long)]
+        owner: String,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+        #[arg(long)]
+        title: String,
+    },
+    /// Add missing workflow Status options, preserving existing option IDs
+    InitStatuses { url: String },
     /// Read Project metadata and field options
     Show { url: String },
     /// List all visible Project items and their Status
@@ -91,6 +213,11 @@ enum ProjectCommand {
 
 #[derive(Subcommand)]
 enum IssueCommand {
+    /// Read-only recovery lookup; never submits a create request
+    RecoverCreate {
+        #[arg(long)]
+        request_id: String,
+    },
     /// List all visible open and closed issues in the default repository
     List,
     /// Read an issue, optionally including all comments
@@ -162,7 +289,7 @@ enum IssueCommand {
 impl IssueCommand {
     fn url(&self) -> Option<&str> {
         match self {
-            Self::List | Self::Create { .. } => None,
+            Self::List | Self::Create { .. } | Self::RecoverCreate { .. } => None,
             Self::Show { url, .. }
             | Self::Comments { url }
             | Self::Update { url, .. }
@@ -208,17 +335,71 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
     }
+    if let Command::Workflow(command) = command {
+        let (args, apply, expected, cleanup) = match command {
+            WorkflowCommand::Inspect(args) => (args, false, None, None),
+            WorkflowCommand::CleanupCheck {
+                args,
+                worktree,
+                confirm_no_dependent_work,
+            } => (
+                args,
+                false,
+                None,
+                Some((worktree, confirm_no_dependent_work)),
+            ),
+            WorkflowCommand::Reconcile {
+                args,
+                apply,
+                expected_head_sha,
+            } => (args, apply, expected_head_sha, None),
+            _ => unreachable!("offline workflow command handled before configuration"),
+        };
+        let contract = input::<issueflow::branch_contract::BranchContract>(&args.file)?;
+        let parent = args
+            .parent_file
+            .as_ref()
+            .map(|p| input::<issueflow::branch_contract::BranchContract>(p))
+            .transpose()?;
+        let workflow = input::<issueflow::workflow_config::WorkflowConfig>(&args.config_file)?;
+        workflow.validate()?;
+        contract.validate(parent.as_ref())?;
+        let transport = SdkTransport::new(&config, issueflow::config::Platform::Github)?;
+        let recovery = issueflow::recovery::Recovery {
+            config: &config,
+            transport: &transport,
+            contract: &contract,
+            parent: parent.as_ref(),
+            workflow: &workflow,
+        };
+        if let Some((path, confirmed)) = cleanup {
+            return issueflow::cleanup::inspect(&recovery, &path, confirmed, args.accepted).await;
+        }
+        return recovery
+            .reconcile(args.accepted, apply, expected.as_deref())
+            .await;
+    }
     if let Command::Pr(command) = command {
         use issueflow::pull::{Pulls, target_from_url};
         let target = match &command {
             PullCommand::List { .. } => Target::defaults(&config)?,
             PullCommand::Create { issue_url, .. } => Target::from_url(&config, issue_url)?,
-            PullCommand::Show { url } | PullCommand::Merge { url, .. } => {
-                target_from_url(&config, url)?
-            }
+            PullCommand::Show { url }
+            | PullCommand::Merge { url, .. }
+            | PullCommand::Update { url, .. }
+            | PullCommand::Ready { url, .. }
+            | PullCommand::Checks { url } => target_from_url(&config, url)?,
         };
         if target.platform != issueflow::config::Platform::Github {
             return Err(Error::new("input", "PR commands support GitHub only"));
+        }
+        if matches!(command, PullCommand::Ready { .. })
+            && config.github_api_url.as_str() != "https://api.github.com/"
+        {
+            return Err(Error::new(
+                "configuration",
+                "PR ready currently supports github.com only",
+            ));
         }
         let transport = SdkTransport::new(&config, target.platform)?;
         let service = Pulls {
@@ -226,10 +407,23 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             target,
         };
         return match command {
-            PullCommand::List { head, base } => {
-                service.list(head.as_deref(), base.as_deref()).await
+            PullCommand::List { head, base, state } => {
+                service
+                    .list_state(head.as_deref(), base.as_deref(), state)
+                    .await
             }
             PullCommand::Show { .. } => service.show().await,
+            PullCommand::Checks { .. } => {
+                issueflow::pull_checks::inspect(&transport, service.target).await
+            }
+            PullCommand::Update {
+                file,
+                expected_head_sha,
+                ..
+            } => service.update(input(&file)?, &expected_head_sha).await,
+            PullCommand::Ready {
+                expected_head_sha, ..
+            } => service.ready(&expected_head_sha).await,
             PullCommand::Create { issue_url, file } => {
                 service.create(input(&file)?, &issue_url).await
             }
@@ -247,13 +441,24 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
     }
     if let Command::Project(command) = command {
         use issueflow::project::{ProjectTarget, Projects};
-        let url = match &command {
+        let target = match &command {
+            ProjectCommand::List { owner, owner_type }
+            | ProjectCommand::Create {
+                owner, owner_type, ..
+            } => ProjectTarget::parse(
+                &config,
+                &format!(
+                    "https://github.com/{}/{}/projects/1",
+                    owner_type.path(),
+                    owner
+                ),
+            )?,
             ProjectCommand::Show { url }
             | ProjectCommand::Items { url }
+            | ProjectCommand::InitStatuses { url }
             | ProjectCommand::Add { url, .. }
-            | ProjectCommand::Status { url, .. } => url,
+            | ProjectCommand::Status { url, .. } => ProjectTarget::parse(&config, url)?,
         };
-        let target = ProjectTarget::parse(&config, url)?;
         let issue = match &command {
             ProjectCommand::Add { issue_url, .. } | ProjectCommand::Status { issue_url, .. } => {
                 let t = Target::from_url(&config, issue_url)?;
@@ -271,6 +476,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         };
         return match command {
             ProjectCommand::Show { .. } => service.show().await,
+            ProjectCommand::List { .. } => service.owner_projects().await,
+            ProjectCommand::Create { title, .. } => service.create(&title).await,
+            ProjectCommand::InitStatuses { .. } => service.init_statuses().await,
             ProjectCommand::Items { .. } => service.items().await,
             ProjectCommand::Add { .. } => service.add(issue.as_ref().unwrap()).await,
             ProjectCommand::Status { to, .. } => {
@@ -294,6 +502,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         Command::SetupLabels => service.setup_labels().await,
         Command::Issue(command) => match command {
             IssueCommand::List => service.list().await,
+            IssueCommand::RecoverCreate { request_id } => service.recover_create(&request_id).await,
             IssueCommand::Show { comments, .. } => {
                 let issue = service.show().await?;
                 if comments {
@@ -362,6 +571,32 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    match &cli.command {
+        Command::Capabilities => {
+            return finish(Ok(
+                json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
+            ));
+        }
+        Command::Workflow(WorkflowCommand::ValidateContract { file, parent_file }) => {
+            let result = (|| {
+                let c = input::<issueflow::branch_contract::BranchContract>(file)?;
+                let parent = parent_file
+                    .as_ref()
+                    .map(|p| input::<issueflow::branch_contract::BranchContract>(p))
+                    .transpose()?;
+                c.validate(parent.as_ref())
+            })();
+            return finish(result);
+        }
+        Command::Workflow(WorkflowCommand::Validate { file }) => {
+            return finish(
+                input::<issueflow::workflow_config::WorkflowConfig>(file)
+                    .and_then(|v| v.validate()),
+            );
+        }
+        _ => {}
+    }
+
     let result = (|| {
         let file = if cli.no_env_file {
             HashMap::new()

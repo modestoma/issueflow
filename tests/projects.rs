@@ -373,3 +373,145 @@ async fn archived_status_writes_are_rejected() {
         "input"
     );
 }
+
+fn owner_list(nodes: Value) -> Value {
+    json!({"data":{"owner":{"id":"OWNER1","projectsV2":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}})
+}
+fn initialized_fields() -> Value {
+    page(
+        "fields",
+        json!([{"id":"F1","name":"Status","options":[
+{"id":"old","name":"Todo","color":"BLUE","description":"keep me"},
+{"id":"b","name":"Backlog","color":"GRAY","description":""},
+{"id":"r","name":"Ready","color":"BLUE","description":""},
+{"id":"p","name":"In progress","color":"YELLOW","description":""},
+{"id":"v","name":"In review","color":"PURPLE","description":""},
+{"id":"d","name":"Done","color":"GREEN","description":""},
+{"id":"c","name":"Cancelled","color":"GRAY","description":""}]}]),
+        false,
+        Value::Null,
+    )
+}
+#[tokio::test]
+async fn create_reuses_unique_open_title() {
+    let m = Mock::new(vec![
+        owner_list(json!([{"id":"P1","number":1,"title":"Board","closed":false}])),
+        meta(),
+        fields(),
+    ]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .create("Board")
+    .await
+    .unwrap();
+    assert_eq!(v["reused"], true);
+    assert!(
+        m.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v["query"].as_str().unwrap().starts_with("query"))
+    );
+}
+#[tokio::test]
+async fn create_verifies_new_project() {
+    let m = Mock::new(vec![
+        owner_list(json!([])),
+        json!({"data":{"createProjectV2":{"projectV2":{"id":"P1","number":1}}}}),
+        meta(),
+        fields(),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .create("Board")
+        .await
+        .unwrap()["reused"],
+        false
+    );
+    assert_eq!(m.calls.lock().unwrap()[1]["variables"]["owner"], "OWNER1");
+}
+#[tokio::test]
+async fn ambiguous_titles_never_create() {
+    let m = Mock::new(vec![owner_list(
+        json!([{"title":"Board"},{"title":"Board"}]),
+    )]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .create("Board")
+        .await
+        .unwrap_err()
+        .code,
+        "response"
+    );
+}
+#[tokio::test]
+async fn statuses_preserve_existing_ids_and_metadata() {
+    let old = page(
+        "fields",
+        json!([{"id":"F1","name":"Status","options":[{"id":"old","name":"Todo","color":"BLUE","description":"keep me"}]}]),
+        false,
+        Value::Null,
+    );
+    let m = Mock::new(vec![
+        meta(),
+        old.clone(),
+        meta(),
+        old,
+        json!({"data":{"updateProjectV2Field":{}}}),
+        meta(),
+        initialized_fields(),
+    ]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .init_statuses()
+    .await
+    .unwrap();
+    assert_eq!(v["changed"], true);
+    let c = m.calls.lock().unwrap();
+    assert_eq!(
+        c[4]["variables"]["options"][0],
+        json!({"id":"old","name":"Todo","color":"BLUE","description":"keep me"})
+    );
+}
+#[tokio::test]
+async fn initialized_statuses_do_not_write() {
+    let m = Mock::new(vec![meta(), initialized_fields()]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .init_statuses()
+        .await
+        .unwrap()["changed"],
+        false
+    );
+    assert_eq!(m.calls.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn ambiguous_existing_title_reports_conflict() {
+    let m = Mock::new(vec![owner_list(
+        json!([{"id":"p1","title":"Board"},{"id":"p2","title":"Board"}]),
+    )]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .create("Board")
+        .await
+        .unwrap_err()
+        .code,
+        "conflict"
+    );
+}
