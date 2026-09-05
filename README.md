@@ -149,4 +149,4 @@ cargo clippy --all-targets -- -D warnings
 
 Automated tests cover configuration, credential redaction, URL handling, pagination, write mappings, duplicate detection, state changes, and dependency rules. Local HTTP servers verify both SDKs' authentication headers, base paths, JSON handling, empty `204` responses, redirects, and rate limiting. These tests do not write to real repositories.
 
-Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. See the [GitHub acceptance report](docs/github-acceptance-20260905.md) (in Chinese) for evidence and limitations. Live validation against Jihu GitLab v18.4.6-jh is still pending.
+Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. Live validation against Jihu GitLab v18.4.6-jh is still pending.
