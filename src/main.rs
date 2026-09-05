@@ -28,6 +28,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create, inspect and explicitly merge GitHub pull requests
+    #[command(subcommand)]
+    Pr(PullCommand),
     /// Read and manage GitHub Projects v2
     #[command(subcommand)]
     Project(ProjectCommand),
@@ -40,6 +43,33 @@ enum Command {
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+}
+
+#[derive(Subcommand)]
+enum PullCommand {
+    List {
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        base: Option<String>,
+    },
+    Show {
+        url: String,
+    },
+    Create {
+        issue_url: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Merge {
+        url: String,
+        #[arg(long)]
+        expected_head_sha: String,
+        #[arg(long)]
+        expected_base: String,
+        #[arg(long, value_enum, default_value = "merge")]
+        method: issueflow::pull::MergeMethod,
+    },
 }
 
 #[derive(Subcommand)]
@@ -111,9 +141,16 @@ enum IssueCommand {
         url: String,
         #[arg(long, value_enum)]
         reason: CloseReason,
+        /// Only change native issue state; preserve labels
+        #[arg(long)]
+        no_workflow_labels: bool,
     },
     /// Reopen and return to triage, clearing the old resolution
-    Reopen { url: String },
+    Reopen {
+        url: String,
+        #[arg(long)]
+        no_workflow_labels: bool,
+    },
     /// List native blocking dependencies
     Dependencies { url: String },
     /// Mark the first issue as blocked by the second, checking for cycles
@@ -133,7 +170,7 @@ impl IssueCommand {
             | Self::Labels { url, .. }
             | Self::Transition { url, .. }
             | Self::Close { url, .. }
-            | Self::Reopen { url }
+            | Self::Reopen { url, .. }
             | Self::Dependencies { url }
             | Self::AddDependency { url, .. }
             | Self::RemoveDependency { url, .. } => Some(url),
@@ -170,6 +207,43 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         return Ok(
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
+    }
+    if let Command::Pr(command) = command {
+        use issueflow::pull::{Pulls, target_from_url};
+        let target = match &command {
+            PullCommand::List { .. } => Target::defaults(&config)?,
+            PullCommand::Create { issue_url, .. } => Target::from_url(&config, issue_url)?,
+            PullCommand::Show { url } | PullCommand::Merge { url, .. } => {
+                target_from_url(&config, url)?
+            }
+        };
+        if target.platform != issueflow::config::Platform::Github {
+            return Err(Error::new("input", "PR commands support GitHub only"));
+        }
+        let transport = SdkTransport::new(&config, target.platform)?;
+        let service = Pulls {
+            transport: &transport,
+            target,
+        };
+        return match command {
+            PullCommand::List { head, base } => {
+                service.list(head.as_deref(), base.as_deref()).await
+            }
+            PullCommand::Show { .. } => service.show().await,
+            PullCommand::Create { issue_url, file } => {
+                service.create(input(&file)?, &issue_url).await
+            }
+            PullCommand::Merge {
+                expected_head_sha,
+                expected_base,
+                method,
+                ..
+            } => {
+                service
+                    .merge(&expected_head_sha, &expected_base, method)
+                    .await
+            }
+        };
     }
     if let Command::Project(command) = command {
         use issueflow::project::{ProjectTarget, Projects};
@@ -249,8 +323,26 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             IssueCommand::Comment { file, .. } => service.comment(read_file(&file)?).await,
             IssueCommand::Labels { add, remove, .. } => service.labels(add, remove).await,
             IssueCommand::Transition { to, .. } => service.transition(to).await,
-            IssueCommand::Close { reason, .. } => service.close(reason).await,
-            IssueCommand::Reopen { .. } => service.reopen().await,
+            IssueCommand::Close {
+                reason,
+                no_workflow_labels,
+                ..
+            } => {
+                if no_workflow_labels {
+                    service.native_state(Some(reason)).await
+                } else {
+                    service.close(reason).await
+                }
+            }
+            IssueCommand::Reopen {
+                no_workflow_labels, ..
+            } => {
+                if no_workflow_labels {
+                    service.native_state(None).await
+                } else {
+                    service.reopen().await
+                }
+            }
             IssueCommand::Dependencies { .. } => service.dependencies().await,
             IssueCommand::AddDependency { blocker_url, .. } => {
                 service

@@ -79,7 +79,7 @@ impl Service<'_> {
     pub async fn show(&self) -> Result<Value> {
         normalize(&self.raw_issue().await?, self.target.platform)
     }
-    async fn pages(&self, endpoint: &str) -> Result<Vec<Value>> {
+    pub(crate) async fn pages(&self, endpoint: &str) -> Result<Vec<Value>> {
         let mut all = Vec::new();
         let mut ids = BTreeSet::new();
         for page in 1..=1000 {
@@ -363,6 +363,33 @@ impl Service<'_> {
             return Err(Error::new("input", "issue 已关闭，请先明确执行 reopen"));
         }
         self.set_stage(stage.label(), vec![], vec![]).await
+    }
+    /// Change native state without touching any labels (for Project-backed workflows).
+    pub async fn native_state(&self, reason: Option<CloseReason>) -> Result<Value> {
+        self.raw_issue().await?;
+        let payload = if self.gh() {
+            match reason {
+                Some(CloseReason::Completed) => {
+                    json!({"state":"closed","state_reason":"completed"})
+                }
+                Some(_) => json!({"state":"closed","state_reason":"not_planned"}),
+                None => json!({"state":"open"}),
+            }
+        } else {
+            json!({"state_event":if reason.is_some(){"close"}else{"reopen"}})
+        };
+        self.transport
+            .request(self.edit_method(), &self.target.endpoint()?, Some(payload))
+            .await?;
+        let result = self.show().await.map_err(partial)?;
+        let expected = if reason.is_some() { "closed" } else { "open" };
+        if result["state"] != expected {
+            return Err(partial(Error::new(
+                "conflict",
+                "Native state readback differs",
+            )));
+        }
+        Ok(result)
     }
     pub async fn close(&self, reason: CloseReason) -> Result<Value> {
         let current = self.raw_issue().await?;

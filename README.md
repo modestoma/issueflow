@@ -91,7 +91,7 @@ issueflow issue remove-dependency https://github.com/owner/repo/issues/42 https:
 
 The first issue is **blocked by the second issue**. Before adding a dependency, the CLI traverses reachable blockers and checks for cycles, up to 1,000 nodes. GitHub uses the dependencies API; GitLab uses issue links. Dependencies may cross repositories but must remain on the same platform and instance. Unsupported versions or insufficient permissions produce API errors; ordinary related-to links are never presented as blocking relationships. Native GitLab blocking relationships depend on the instance license.
 
-Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent-child hierarchies, fallback dependencies in issue bodies, PR/MR operations, and worktree automation are outside this version's scope.
+Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Native parent-child hierarchy APIs, GitLab MR operations, and worktree automation are outside this version's scope. Parent/child issue URLs and branch contracts can be maintained in issue bodies.
 
 ## GitHub Projects
 
@@ -125,7 +125,7 @@ For a board using these stages, the recommended workflow mapping is:
 
 Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. The CLI does not create fields or options. Keep type, priority, and blocked labels independently.
 
-Projects-backed GitHub workflows should use `project status` as the stage store instead of calling the label-based `issue transition`. Existing `issue transition`, `issue close`, and `issue reopen` still maintain workflow labels; they have not been converted to Project-aware operations. Do not use both mechanisms to mirror stages. Project-aware native issue closure is outside these commands' scope.
+Projects-backed GitHub workflows should use `project status` as the stage store instead of calling the label-based `issue transition`. `issue transition` remains label-based. For Project-backed workflows, close/reopen with `--no-workflow-labels` to change only native issue state and preserve all labels; update Project Status separately. This option also leaves resolution labels unchanged, so reconcile termination reasons explicitly when needed. Without the flag, existing close/reopen label behavior remains unchanged.
 
 **Project Status and issue state are separate.** The CLI does not send issue-close mutations when changing Status. However, GitHub Project automations can close issues or overwrite Status when items change. Inspect the Project's Workflows settings before using live status writes; disable automatic closure if it would bypass human acceptance. Moving a card does not launch Codex or authorize merging or deployment.
 
@@ -136,6 +136,45 @@ Issue write permissions alone are insufficient for Projects. For personal Projec
 HTTP-200 responses containing GraphQL errors are failures, even when partial data is present. Known insufficient-scope/forbidden errors return the permission exit code; raw error messages are not printed. Queries use POST but are classified as read-only for unknown-outcome reporting. Failed mutations or failed readback can report `outcome_unknown: true`; inspect Project items/Status before another write. There are no automatic mutation retries, background synchronization, or cross-user transactions.
 
 Live validation against the configured personal Project passed metadata/options and item reads, existing membership reuse, invalid-option rejection, Status changes through Ready / In progress / In review, and matching-Status no-op behavior. The issue remained open. Creating a new Project membership has local test coverage but has not been exercised against a live account. Organization-owned Project URL parsing is tested; its GraphQL lookup has not been live-validated.
+
+## GitHub pull requests and branch delivery
+
+One issue can own a long-lived development branch with multiple commits. Git manages worktrees, branches, commits, and pushes; issueflow manages GitHub PRs. Branch names can use `feat/`, `fix/`, `refactor/`, `docs/`, or project conventions. A child issue's PR targets its parent integration branch, not necessarily `main`.
+
+```sh
+issueflow --platform github --repository owner/repo pr list --head feat/issue-5-example --base feat/issue-1-parent
+issueflow pr create https://github.com/owner/repo/issues/5 --file pr.json
+issueflow pr show https://github.com/owner/repo/pull/8
+```
+
+Example `pr.json` (UTF-8; `--file -` also accepts stdin):
+
+```json
+{
+  "title": "Add the child feature",
+  "body": "Describe the resulting behavior and validation.",
+  "head": "feat/issue-5-example",
+  "base": "feat/issue-1-parent",
+  "draft": false
+}
+```
+
+Push the head branch first. Head and base must be distinct branches in the same repository; fork heads are not supported in this version. Unknown JSON fields are rejected. The CLI appends `Refs <issue URL>` rather than an automatic closing keyword; do not include `Fixes` or `Closes` directives yourself if closure must wait for acceptance. PR output retains GitHub's native fields, including `html_url`, `head.sha`, and `base.ref`.
+
+`pr list` returns open PRs with complete pagination. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
+
+After explicit review and merge authorization:
+
+```sh
+issueflow pr merge https://github.com/owner/repo/pull/8 --expected-base feat/issue-1-parent --expected-head-sha FULL_40_CHARACTER_SHA --method merge
+issueflow issue close https://github.com/owner/repo/issues/5 --reason completed --no-workflow-labels
+```
+
+Merge requires an open, non-draft PR with the expected target and full head SHA. The SHA is also passed to GitHub's merge endpoint; draft, stale expectations, unconfirmed merge responses, and failed readback are errors. Methods are `merge` (default), `squash`, and `rebase`. GitHub permissions and branch protections still apply. Target-branch validation is a read-before-write check, not an atomic lock against concurrent retargeting. This implementation handles ordinary PRs, not GitHub native stacked-PR batch merges or merge queues.
+
+Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. Project-backed closure uses `--no-workflow-labels`; reopening has the same flag. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
+
+Current commands do not edit PR metadata, read all review/check-run details, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
 
 ## Output and errors
 
