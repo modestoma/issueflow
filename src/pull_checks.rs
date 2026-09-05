@@ -1,4 +1,5 @@
 use crate::{
+    config::Platform,
     error::{Error, Result},
     pull::Pulls,
     service::Service,
@@ -17,6 +18,9 @@ pub async fn inspect(transport: &dyn Transport, target: Target) -> Result<Value>
         target: target.clone(),
     };
     let before = pulls.show().await?;
+    if target.platform == Platform::Gitlab {
+        return inspect_gitlab(transport, target, pulls, before).await;
+    }
     let sha = before["head"]["sha"]
         .as_str()
         .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
@@ -73,6 +77,87 @@ pub async fn inspect(transport: &dyn Transport, target: Target) -> Result<Value>
         ));
     }
     summarize(sha, &checks, &statuses, &reviews)
+}
+async fn inspect_gitlab(
+    transport: &dyn Transport,
+    target: Target,
+    pulls: Pulls<'_>,
+    before: Value,
+) -> Result<Value> {
+    let sha = before["diff_refs"]["head_sha"]
+        .as_str()
+        .or_else(|| before["sha"].as_str())
+        .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(bad)?;
+    let iid = target.number.ok_or_else(bad)?;
+    let root = format!(
+        "projects/{}/merge_requests/{iid}",
+        crate::target::encode(&target.repository)
+    );
+    let service = Service {
+        transport,
+        target: target.clone(),
+    };
+    let pipelines = service.pages(&format!("{root}/pipelines")).await?;
+    let approvals = transport
+        .request(Method::GET, &format!("{root}/approvals"), None)
+        .await?;
+    let after = pulls.show().await?;
+    for key in [
+        "source_branch",
+        "target_branch",
+        "source_project_id",
+        "target_project_id",
+    ] {
+        if before[key] != after[key] {
+            return Err(Error::new(
+                "conflict",
+                "MR head or base changed while reading checks; inspect again",
+            ));
+        }
+    }
+    let after_sha = after["diff_refs"]["head_sha"]
+        .as_str()
+        .or_else(|| after["sha"].as_str());
+    if after_sha != Some(sha) {
+        return Err(Error::new(
+            "conflict",
+            "MR head or base changed while reading checks; inspect again",
+        ));
+    }
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut pending = 0;
+    let mut neutral = 0;
+    for pipeline in &pipelines {
+        match pipeline["status"].as_str().ok_or_else(bad)? {
+            "success" => passed += 1,
+            "failed" | "canceled" => failed += 1,
+            "skipped" | "manual" => neutral += 1,
+            _ => pending += 1,
+        }
+    }
+    let observed = if pipelines.is_empty() {
+        "absent"
+    } else if failed > 0 {
+        "failed"
+    } else if pending > 0 {
+        "pending"
+    } else if neutral > 0 {
+        "non_failing"
+    } else {
+        "passed"
+    };
+    Ok(json!({
+        "head_sha": sha,
+        "observed_checks": observed,
+        "counts":{"passed":passed,"failed":failed,"pending":pending,"neutral_or_skipped":neutral},
+        "pipelines": pipelines,
+        "approvals": approvals,
+        "merge_authorized": false,
+        "policy_evaluated": false,
+        "note":"Observed GitLab evidence only. Missing pipelines are not a pass; approval data does not grant merge authorization. Protected branch rules, server policy, and human acceptance still apply."
+    }))
 }
 pub fn summarize(
     sha: &str,

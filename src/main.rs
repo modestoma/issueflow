@@ -424,10 +424,8 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             | PullCommand::Ready { url, .. }
             | PullCommand::Checks { url } => target_from_url(&config, url)?,
         };
-        if target.platform != issueflow::config::Platform::Github {
-            return Err(Error::new("input", "PR commands support GitHub only"));
-        }
         if matches!(command, PullCommand::Ready { .. })
+            && target.platform == issueflow::config::Platform::Github
             && config.github_api_url.as_str() != "https://api.github.com/"
         {
             return Err(Error::new(
