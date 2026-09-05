@@ -29,7 +29,14 @@ impl Hierarchy<'_> {
         Ok(format!("{}/sub_issues", self.parent.endpoint()?))
     }
     pub async fn parent(&self) -> Result<Value> {
-        self.github()?;
+        if self.parent.platform == Platform::Gitlab {
+            let item = self.gitlab_item(None).await?;
+            return Ok(item["widgets"]
+                .as_array()
+                .and_then(|widgets| widgets.iter().find(|widget| widget["type"] == "HIERARCHY"))
+                .map(|widget| widget["parent"].clone())
+                .unwrap_or(Value::Null));
+        }
         self.transport
             .request(
                 Method::GET,
@@ -39,12 +46,86 @@ impl Hierarchy<'_> {
             .await
     }
     pub async fn children(&self) -> Result<Value> {
-        self.github()?;
+        if self.parent.platform == Platform::Gitlab {
+            let mut children = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut seen = BTreeSet::new();
+            for _ in 0..1000 {
+                let item = self.gitlab_item(cursor.as_deref()).await?;
+                let widget = item["widgets"]
+                    .as_array()
+                    .and_then(|widgets| widgets.iter().find(|widget| widget["type"] == "HIERARCHY"))
+                    .ok_or_else(|| {
+                        Error::new("response", "GitLab work item has no hierarchy widget")
+                    })?;
+                let connection = &widget["children"];
+                for child in connection["nodes"].as_array().ok_or_else(|| {
+                    Error::new("response", "GitLab hierarchy children are incomplete")
+                })? {
+                    let id = child["id"]
+                        .as_str()
+                        .ok_or_else(|| Error::new("response", "GitLab child has no id"))?;
+                    if !seen.insert(id.to_string()) {
+                        return Err(Error::new(
+                            "conflict",
+                            "GitLab hierarchy changed during pagination",
+                        ));
+                    }
+                    children.push(child.clone());
+                }
+                if connection["pageInfo"]["hasNextPage"] != true {
+                    return Ok(Value::Array(children));
+                }
+                cursor = Some(
+                    connection["pageInfo"]["endCursor"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            Error::new("response", "GitLab hierarchy cursor is missing")
+                        })?
+                        .to_string(),
+                );
+            }
+            return Err(Error::new(
+                "response",
+                "GitLab hierarchy pagination limit exceeded",
+            ));
+        }
         let service = Service {
             transport: self.transport,
             target: self.parent.clone(),
         };
         Ok(Value::Array(service.pages(&self.root()?).await?))
+    }
+    async fn gitlab_item(&self, after: Option<&str>) -> Result<Value> {
+        let iid = self
+            .parent
+            .number
+            .ok_or_else(|| Error::new("input", "GitLab work item URL requires an iid"))?
+            .to_string();
+        let response = self.transport.request(Method::POST, "graphql", Some(json!({
+            "query":"query($fullPath:ID!,$iid:String!,$after:String){namespace(fullPath:$fullPath){workItem(iid:$iid){id iid title webUrl workItemType{name} widgets{type ... on WorkItemWidgetHierarchy{parent{id iid title webUrl workItemType{name}} children(first:100,after:$after){nodes{id iid title webUrl workItemType{name}} pageInfo{hasNextPage endCursor}}}}}}}",
+            "variables":{"fullPath":self.parent.repository,"iid":iid,"after":after}
+        }))).await?;
+        if response
+            .get("errors")
+            .is_some_and(|errors| !errors.as_array().is_some_and(|items| items.is_empty()))
+        {
+            return Err(Error::new(
+                "graphql",
+                "GitLab Work Item hierarchy query failed",
+            ));
+        }
+        let item = &response["data"]["namespace"]["workItem"];
+        if !item["id"].is_string()
+            || !item["workItemType"]["name"].is_string()
+            || !item["widgets"].is_array()
+        {
+            return Err(Error::new(
+                "response",
+                "Incomplete GitLab work item response",
+            ));
+        }
+        Ok(item.clone())
     }
     async fn ensure_no_cycle(&self, child: &Target) -> Result<()> {
         let mut queue = VecDeque::from([child.clone()]);

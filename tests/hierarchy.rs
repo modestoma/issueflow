@@ -114,9 +114,10 @@ async fn cycle_is_rejected_before_write() {
 }
 
 #[tokio::test]
-async fn gitlab_fails_explicitly_until_graphql_adapter_is_available() {
+async fn gitlab_reads_parent_and_children_with_work_item_types() {
+    let response = json!({"data":{"namespace":{"workItem":{"id":"gid://gitlab/WorkItem/2","iid":"2","title":"Issue","webUrl":"https://gitlab.example/group/repo/-/issues/2","workItemType":{"name":"Issue"},"widgets":[{"type":"HIERARCHY","parent":{"id":"gid://gitlab/WorkItem/1","iid":"1","title":"Epic","webUrl":"https://gitlab.example/groups/group/-/epics/1","workItemType":{"name":"Epic"}},"children":{"nodes":[{"id":"gid://gitlab/WorkItem/3","iid":"3","title":"Task","webUrl":"https://gitlab.example/group/repo/-/work_items/3","workItemType":{"name":"Task"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}]}}}});
     let mock = Mock {
-        replies: Mutex::new(vec![].into()),
+        replies: Mutex::new(vec![response.clone(), response].into()),
         calls: Mutex::new(vec![]),
     };
     let hierarchy = Hierarchy {
@@ -127,13 +128,22 @@ async fn gitlab_fails_explicitly_until_graphql_adapter_is_available() {
             number: Some(2),
         },
     };
-    assert!(
-        hierarchy
-            .children()
-            .await
-            .unwrap_err()
-            .message
-            .contains("GraphQL")
+    assert_eq!(
+        hierarchy.parent().await.unwrap()["workItemType"]["name"],
+        "Epic"
     );
-    assert!(mock.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        hierarchy.children().await.unwrap()[0]["workItemType"]["name"],
+        "Task"
+    );
+    let calls = mock.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .all(|(method, endpoint, _)| *method == Method::POST && endpoint == "graphql")
+    );
+    assert_eq!(
+        calls[0].2.as_ref().unwrap()["variables"]["fullPath"],
+        "group/repo"
+    );
 }
