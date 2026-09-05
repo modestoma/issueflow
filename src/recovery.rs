@@ -18,7 +18,9 @@ pub struct Snapshot {
     pub issue_state: String,
     pub issue_reason: Option<String>,
     pub has_resolution: bool,
-    pub workflow_labels: Vec<String>,
+    pub resolution: Option<String>,
+    pub project_blocked: bool,
+    pub metadata_ready: bool,
     pub pr_state: Option<String>,
     pub pr_merged: bool,
     pub pr_draft: bool,
@@ -42,6 +44,15 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
         actions: vec![],
         blockers: vec![reason],
     };
+    if !s.project_configured {
+        return stop("setup_required", "github_project_required");
+    }
+    if !s.metadata_ready {
+        return stop("setup_required", "project_workflow_fields_required");
+    }
+    if s.project_blocked {
+        return stop("delivery_pending", "project_blocked");
+    }
     if !matches!(s.issue_state.as_str(), "open" | "closed")
         || s.pr_state
             .as_deref()
@@ -92,12 +103,8 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
             actions.push("set_project_done");
         }
     }
-    if s.project_configured {
-        if !s.workflow_labels.is_empty() {
-            actions.push("remove_workflow_labels");
-        }
-    } else if s.workflow_labels != ["workflow::已完成"] {
-        actions.push("set_workflow_done");
+    if s.resolution.as_deref() != Some("Completed") {
+        actions.push("set_resolution_completed");
     }
     if s.issue_state != "closed" {
         actions.push("close_issue");
@@ -165,15 +172,8 @@ impl Recovery<'_> {
         let mut s = Snapshot {
             issue_state: issue["state"].as_str().ok_or_else(bad)?.into(),
             issue_reason: issue["state_reason"].as_str().map(String::from),
-            has_resolution: crate::service::labels(&issue)?
-                .iter()
-                .any(|l| l.starts_with("resolution::")),
             ..Default::default()
         };
-        s.workflow_labels = crate::service::labels(&issue)?
-            .into_iter()
-            .filter(|l| l.starts_with("workflow::"))
-            .collect();
         let pr_target = if let Some(url) = &self.contract.pr_url {
             Some(target_from_url(self.config, url)?)
         } else {
@@ -291,6 +291,15 @@ impl Recovery<'_> {
                     .filter(|o| o["name"] == "Done")
                     .count()
                     == 1;
+            s.metadata_ready = ["Work type", "Priority", "Blocked", "Resolution"]
+                .iter()
+                .all(|name| {
+                    fields
+                        .iter()
+                        .filter(|f| f["name"] == *name && f["options"].is_array())
+                        .count()
+                        == 1
+                });
             let node = issue["node_id"].as_str().ok_or_else(bad)?;
             let matches: Vec<_> = value["items"]
                 .as_array()
@@ -311,6 +320,9 @@ impl Recovery<'_> {
                         "Project item is archived; inspect before recovery",
                     ));
                 }
+                s.resolution = item["resolution"]["name"].as_str().map(String::from);
+                s.has_resolution = s.resolution.as_deref().is_some_and(|r| r != "Completed");
+                s.project_blocked = item["blocked"]["name"].as_str().is_some_and(|b| b != "No");
                 s.in_project = true;
                 s.project_status = item["fieldValueByName"]["name"].as_str().map(String::from);
             }
@@ -366,30 +378,11 @@ impl Recovery<'_> {
                         .status(&self.target()?, Some("Done"))
                         .await
                 }
-                "remove_workflow_labels" | "set_workflow_done" => {
-                    let service = Service {
-                        transport: self.transport,
-                        target: self.target()?,
-                    };
-                    let labels = crate::service::labels(
-                        &service
-                            .raw_issue()
-                            .await
-                            .map_err(|e| partial(e, &completed))?,
-                    )?;
-                    let remove = labels
-                        .into_iter()
-                        .filter(|l| {
-                            l.starts_with("workflow::")
-                                && (*action == "remove_workflow_labels" || l != "workflow::已完成")
-                        })
-                        .collect();
-                    let add = if *action == "set_workflow_done" {
-                        vec!["workflow::已完成".to_string()]
-                    } else {
-                        vec![]
-                    };
-                    service.labels(add, remove).await
+                "set_resolution_completed" => {
+                    self.project()?
+                        .ok_or_else(bad)?
+                        .field(&self.target()?, "Resolution", Some("Completed"), false)
+                        .await
                 }
                 "close_issue" => {
                     Service {

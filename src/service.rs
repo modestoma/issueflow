@@ -389,6 +389,12 @@ impl Service<'_> {
         Ok(result)
     }
     pub async fn transition(&self, stage: Stage) -> Result<Value> {
+        if self.gh() {
+            return Err(Error::new(
+                "input",
+                "GitHub workflow stages use project status; configure a Project first",
+            ));
+        }
         let current = self.raw_issue().await?;
         if current["state"] == "closed" {
             return Err(Error::new("input", "issue 已关闭，请先明确执行 reopen"));
@@ -423,6 +429,9 @@ impl Service<'_> {
         Ok(result)
     }
     pub async fn close(&self, reason: CloseReason) -> Result<Value> {
+        if self.gh() {
+            return self.native_state(Some(reason)).await;
+        }
         let current = self.raw_issue().await?;
         let old_resolutions: Vec<_> = labels(&current)?
             .into_iter()
@@ -461,6 +470,9 @@ impl Service<'_> {
         normalize(&result, self.target.platform)
     }
     pub async fn reopen(&self) -> Result<Value> {
+        if self.gh() {
+            return self.native_state(None).await;
+        }
         self.raw_issue().await?;
         let payload = if self.gh() {
             json!({"state":"open"})
@@ -480,6 +492,12 @@ impl Service<'_> {
             .map_err(partial)
     }
     pub async fn setup_labels(&self) -> Result<Value> {
+        if self.gh() {
+            return Err(Error::new(
+                "input",
+                "GitHub workflow metadata uses project init-workflow, not labels",
+            ));
+        }
         let endpoint = match self.target.platform {
             Platform::Github => format!("repos/{}/labels", self.target.repository),
             Platform::Gitlab => format!("projects/{}/labels", encode(&self.target.repository)),

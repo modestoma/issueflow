@@ -515,3 +515,127 @@ async fn ambiguous_existing_title_reports_conflict() {
         "conflict"
     );
 }
+
+fn view_page(nodes: Value) -> Value {
+    json!({"data":{"node":{"views":{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}}})
+}
+fn board() -> Value {
+    json!({"id":"V1","name":"Kanban","layout":"BOARD_LAYOUT","filter":"","groupByFields":{"nodes":[],"pageInfo":{"hasNextPage":false}},"verticalGroupByFields":{"nodes":[{"id":"F1","name":"Status"}],"pageInfo":{"hasNextPage":false}}})
+}
+#[tokio::test]
+async fn existing_status_board_is_reused() {
+    let m = Mock::new(vec![meta(), fields(), view_page(json!([board()]))]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .ensure_board()
+    .await
+    .unwrap();
+    assert_eq!(v["created"], false);
+    assert!(
+        m.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v["query"].as_str().unwrap().starts_with("query"))
+    );
+}
+#[tokio::test]
+async fn new_board_is_read_back_with_status_grouping() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        view_page(json!([])),
+        json!({"data":{"createProjectV2View":{"projectV2View":{"id":"V1"}}}}),
+        view_page(json!([board()])),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .ensure_board()
+        .await
+        .unwrap()["created"],
+        true
+    );
+}
+#[tokio::test]
+async fn wrong_board_grouping_is_not_reported_success() {
+    let mut b = board();
+    b["verticalGroupByFields"]["nodes"] = json!([]);
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        view_page(json!([])),
+        json!({"data":{"createProjectV2View":{"projectV2View":{"id":"V1"}}}}),
+        view_page(json!([b])),
+    ]);
+    assert!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .ensure_board()
+        .await
+        .unwrap_err()
+        .outcome_unknown
+    );
+}
+#[tokio::test]
+async fn arbitrary_select_field_uses_exact_name_and_preserves_status() {
+    let mut f = fields();
+    f["data"]["node"]["fields"]["nodes"][0]["name"] = json!("Priority");
+    let m = Mock::new(vec![
+        meta(),
+        f,
+        id(),
+        page("items", json!([item("O2")]), false, Value::Null),
+        json!({"data":{"updateProjectV2ItemFieldValue":{}}}),
+        page("items", json!([item("O1")]), false, Value::Null),
+    ]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .field(&issue(), "Priority", Some("Ready"), false)
+    .await
+    .unwrap();
+    assert_eq!(v["changed"], true);
+    assert!(
+        m.calls.lock().unwrap()[3]["query"]
+            .as_str()
+            .unwrap()
+            .contains("fieldValueByName(name:\"Priority\")")
+    );
+}
+#[tokio::test]
+async fn clear_field_verifies_unset_value() {
+    let mut cleared = item("O1");
+    cleared["fieldValueByName"] = Value::Null;
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([item("O1")]), false, Value::Null),
+        json!({"data":{"clearProjectV2ItemFieldValue":{}}}),
+        page("items", json!([cleared]), false, Value::Null),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .field(&issue(), "Status", None, true)
+        .await
+        .unwrap()["changed"],
+        true
+    );
+    assert!(
+        m.calls.lock().unwrap()[4]["query"]
+            .as_str()
+            .unwrap()
+            .contains("clearProjectV2ItemFieldValue")
+    );
+}

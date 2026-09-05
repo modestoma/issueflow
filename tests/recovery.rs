@@ -20,7 +20,12 @@ fn completed() -> Snapshot {
         pr_merged: true,
         delivered: true,
         head_sha: Some("a".repeat(40)),
-        workflow_labels: vec!["workflow::已完成".into()],
+        project_configured: true,
+        in_project: true,
+        done_option_available: true,
+        project_status: Some("Done".into()),
+        metadata_ready: true,
+        resolution: Some("Completed".into()),
         ..Default::default()
     }
 }
@@ -43,7 +48,6 @@ fn closed_issue_with_stale_project_only_repairs_project() {
     s.issue_state = "closed".into();
     s.issue_reason = Some("completed".into());
     s.project_configured = true;
-    s.workflow_labels.clear();
     s.in_project = true;
     s.done_option_available = true;
     s.project_status = Some("In review".into());
@@ -55,8 +59,9 @@ fn closed_issue_with_stale_project_only_repairs_project() {
 #[test]
 fn missing_membership_is_ordered_before_status_and_close() {
     let mut s = completed();
+    s.in_project = false;
+    s.project_status = None;
     s.project_configured = true;
-    s.workflow_labels.clear();
     s.done_option_available = true;
     assert_eq!(
         plan(&s, DeliveryPolicy::Merged, false).actions,
@@ -79,7 +84,7 @@ fn missing_target_delivery_and_done_option_block_writes() {
     assert!(plan(&s, DeliveryPolicy::Merged, true).actions.is_empty());
     s.delivered = true;
     s.project_configured = true;
-    s.workflow_labels.clear();
+    s.done_option_available = false;
     assert!(plan(&s, DeliveryPolicy::Merged, true).actions.is_empty());
 }
 #[test]
@@ -95,7 +100,33 @@ struct Mock {
 }
 #[async_trait]
 impl Transport for Mock {
-    async fn request(&self, m: Method, p: &str, _: Option<Value>) -> Result<Value> {
+    async fn request(&self, m: Method, p: &str, body: Option<Value>) -> Result<Value> {
+        if m == Method::POST
+            && p == "graphql"
+            && body
+                .as_ref()
+                .and_then(|v| v["query"].as_str())
+                .is_some_and(|q| q.starts_with("query"))
+        {
+            let body = body.unwrap();
+            let q = body["query"].as_str().unwrap();
+            if q.contains("owner:user") {
+                return Ok(
+                    json!({"data":{"owner":{"projectV2":{"id":"P1","closed":false,"title":"Board"}}}}),
+                );
+            }
+            if q.contains("fields(first:") {
+                return Ok(
+                    json!({"data":{"node":{"fields":{"nodes":[{"id":"F1","name":"Status","options":[{"id":"O1","name":"Done"}]},{"id":"T","name":"Work type","options":[]},{"id":"P","name":"Priority","options":[]},{"id":"B","name":"Blocked","options":[]},{"id":"R","name":"Resolution","options":[]}],"pageInfo":{"hasNextPage":false}}}}}),
+                );
+            }
+            if q.contains("items(first:") {
+                return Ok(
+                    json!({"data":{"node":{"items":{"nodes":[{"id":"ITEM1","content":{"id":"I1"},"isArchived":false,"fieldValueByName":{"name":"Done"},"resolution":{"name":"Completed"},"blocked":{"name":"No"}}],"pageInfo":{"hasNextPage":false}}}}}),
+                );
+            }
+            panic!("unexpected GraphQL query");
+        }
         let (expected, v) = self
             .steps
             .lock()
@@ -115,13 +146,13 @@ fn cfg() -> Config {
     Config::resolve(HashMap::new(), HashMap::new(), Overrides::default()).unwrap()
 }
 fn workflow() -> WorkflowConfig {
-    serde_json::from_value(json!({"schema_version":1,"platform":"github","host":"github.com","repository":"a/b","remote":"origin","base_branch":"main","timezone":"Asia/Shanghai","delivery_policy":"merged","permissions":{"local_commit":true,"push":true}})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"platform":"github","host":"github.com","repository":"a/b","remote":"origin","base_branch":"main","timezone":"Asia/Shanghai","delivery_policy":"merged","github_project_url":"https://github.com/users/a/projects/1","permissions":{"local_commit":true,"push":true}})).unwrap()
 }
 fn contract() -> BranchContract {
     serde_json::from_value(json!({"schema_version":1,"issue_url":"https://github.com/a/b/issues/1","source_branch":"main","branch":"feat/issue-1","pr_target":"main","pr_url":"https://github.com/a/b/pull/2"})).unwrap()
 }
 fn issue(closed: bool) -> Value {
-    json!({"id":1,"number":1,"html_url":"https://github.com/a/b/issues/1","state":if closed{"closed"}else{"open"},"state_reason":if closed{Some("completed")}else{None},"labels":[{"name":"type::feature"},{"name":"workflow::已完成"}]})
+    json!({"id":1,"node_id":"I1","number":1,"html_url":"https://github.com/a/b/issues/1","state":if closed{"closed"}else{"open"},"state_reason":if closed{Some("completed")}else{None},"labels":[{"name":"type::feature"},{"name":"workflow::已完成"},{"name":"resolution::取消"},{"name":"blocked"}]})
 }
 fn pr() -> Value {
     json!({"number":2,"html_url":"https://github.com/a/b/pull/2","state":"closed","merged":true,"draft":false,"head":{"sha":"a".repeat(40),"ref":"feat/issue-1","repo":{"full_name":"a/b"}},"base":{"ref":"main"},"merge_commit_sha":"b".repeat(40),"body":"Refs https://github.com/a/b/issues/1"})
@@ -305,23 +336,22 @@ fn malformed_native_state_never_proposes_mutation() {
 }
 
 #[test]
-fn label_mode_reconciles_stage_before_closing() {
+fn missing_project_blocks_recovery_instead_of_falling_back_to_labels() {
     let mut s = completed();
-    s.workflow_labels = vec!["workflow::开发中".into()];
-    assert_eq!(
-        plan(&s, DeliveryPolicy::Merged, false).actions,
-        vec!["set_workflow_done", "close_issue"]
-    );
+    s.project_configured = false;
+    let p = plan(&s, DeliveryPolicy::Merged, true);
+    assert_eq!(p.phase, "setup_required");
+    assert!(p.actions.is_empty());
 }
 #[test]
-fn project_mode_removes_only_redundant_stage_labels() {
+fn project_blocked_and_resolution_are_authoritative() {
     let mut s = completed();
-    s.project_configured = true;
-    s.in_project = true;
-    s.done_option_available = true;
-    s.project_status = Some("Done".into());
+    s.project_blocked = true;
+    assert!(plan(&s, DeliveryPolicy::Merged, true).actions.is_empty());
+    s.project_blocked = false;
+    s.has_resolution = true;
     assert_eq!(
-        plan(&s, DeliveryPolicy::Merged, false).actions,
-        vec!["remove_workflow_labels", "close_issue"]
+        plan(&s, DeliveryPolicy::Merged, true).phase,
+        "manual_review"
     );
 }

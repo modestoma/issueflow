@@ -289,14 +289,7 @@ async fn labels_preserve_unrelated_labels_and_use_targeted_operations() {
 
 #[tokio::test]
 async fn closed_issue_is_not_silently_reopened_by_transition() {
-    let mut value = issue(Platform::Github, &[]);
-    value["state"] = json!("closed");
-    let mock = Mock::new(vec![step(
-        Method::GET,
-        "repos/owner/repo/issues/2",
-        None,
-        value,
-    )]);
+    let mock = Mock::new(vec![]);
     assert!(
         Service {
             transport: &mock,
