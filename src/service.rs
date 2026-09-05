@@ -161,6 +161,37 @@ impl Service<'_> {
             )
             .await
     }
+    /// Inspect a prior create operation without ever submitting another create request.
+    pub async fn recover_create(&self, operation: &str) -> Result<Value> {
+        let id = uuid::Uuid::parse_str(operation)
+            .map_err(|_| Error::new("input", "request-id must be a UUID"))?;
+        let issues = self.raw_list().await?;
+        let matches = issues
+            .iter()
+            .filter(|v| {
+                v[if self.gh() { "body" } else { "description" }]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .any(|line| {
+                        line.trim()
+                            .strip_prefix("<!-- issueflow-operation: ")
+                            .and_then(|s| s.strip_suffix(" -->"))
+                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                            == Some(id)
+                    })
+            })
+            .map(|v| normalize(v, self.target.platform))
+            .collect::<Result<Vec<_>>>()?;
+        let status = match matches.len() {
+            0 => "not_visible",
+            1 => "found",
+            _ => "ambiguous",
+        };
+        Ok(
+            json!({"operation":id.to_string(),"status":status,"matches":matches,"safe_to_retry":false,"note":"Read-only inspection. No match does not prove the create failed; visibility may lag. Do not retry create to verify its outcome."}),
+        )
+    }
     pub async fn create(&self, mut input: CreateInput, operation: &str) -> Result<Value> {
         uuid::Uuid::parse_str(operation)
             .map_err(|_| Error::new("input", "request-id 必须为 UUID"))?;
