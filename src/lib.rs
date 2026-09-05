@@ -6,3 +6,4 @@ pub mod pull_checks;
 pub mod service;
 pub mod target;
 pub mod transport;
+pub mod workflow_config;

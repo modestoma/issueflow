@@ -22,6 +22,12 @@ pub struct CreatePull {
     #[serde(default)]
     pub draft: bool,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePull {
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
 #[derive(Clone, Copy, ValueEnum)]
 pub enum MergeMethod {
     Merge,
@@ -59,7 +65,7 @@ fn github(t: &Target) -> Result<()> {
         Ok(())
     }
 }
-fn branch(s: &str) -> Result<()> {
+pub(crate) fn branch(s: &str) -> Result<()> {
     if s.is_empty()
         || s == "@"
         || s.starts_with('-')
@@ -210,6 +216,95 @@ impl Pulls<'_> {
             )));
         }
         Ok(json!({"reused":false,"pull_request":verified}))
+    }
+    fn check_edit_head(v: &Value, sha: &str) -> Result<()> {
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::new("input", "Expected a full head SHA"));
+        }
+        if v["state"] != "open" || v["merged"] != false || v["head"]["sha"] != sha {
+            return Err(Error::new(
+                "conflict",
+                "PR closed or head changed; inspect before updating",
+            ));
+        }
+        Ok(())
+    }
+    pub async fn update(&self, input: UpdatePull, sha: &str) -> Result<Value> {
+        if input.title.is_none() && input.body.is_none() {
+            return Err(Error::new("input", "No PR update fields"));
+        }
+        if input.title.as_ref().is_some_and(|s| s.trim().is_empty()) {
+            return Err(Error::new("input", "PR title cannot be empty"));
+        }
+        let current = self.show().await?;
+        Self::check_edit_head(&current, sha)?;
+        let mut payload = json!({});
+        if let Some(title) = input.title {
+            payload["title"] = json!(title);
+        }
+        if let Some(mut body) = input.body {
+            for line in current["body"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .filter(|l| l.starts_with("Refs https://"))
+            {
+                if !body.lines().any(|l| l == line) {
+                    body.push_str(&format!("\n\n{line}"));
+                }
+            }
+            payload["body"] = json!(body);
+        }
+        self.transport
+            .request(Method::PATCH, &self.endpoint()?, Some(payload.clone()))
+            .await?;
+        let verified = self.show().await.map_err(partial)?;
+        for (key, value) in payload.as_object().unwrap() {
+            if verified[key] != *value {
+                return Err(partial(Error::new(
+                    "conflict",
+                    "PR metadata readback differs",
+                )));
+            }
+        }
+        if verified["head"]["sha"] != sha {
+            return Err(partial(Error::new(
+                "conflict",
+                "PR head changed during update",
+            )));
+        }
+        Ok(verified)
+    }
+    pub async fn ready(&self, sha: &str) -> Result<Value> {
+        let current = self.show().await?;
+        Self::check_edit_head(&current, sha)?;
+        if current["draft"] == false {
+            return Ok(json!({"changed":false,"pull_request":current}));
+        }
+        if current["draft"] != true {
+            return Err(Error::new("response", "Missing PR draft state"));
+        }
+        let id = current["node_id"]
+            .as_str()
+            .ok_or_else(|| Error::new("response", "Missing PR node ID"))?;
+        let v=self.transport.request(Method::POST,"graphql",Some(json!({"query":"mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id}}}","variables":{"id":id}}))).await?;
+        if v.get("errors")
+            .is_some_and(|e| !e.as_array().is_some_and(|a| a.is_empty()))
+            || !v["data"]["markPullRequestReadyForReview"]["pullRequest"]["id"].is_string()
+        {
+            return Err(partial(Error::new(
+                "graphql",
+                "Unable to confirm ready-for-review mutation",
+            )));
+        }
+        let verified = self.show().await.map_err(partial)?;
+        if verified["draft"] != false || verified["head"]["sha"] != sha {
+            return Err(partial(Error::new(
+                "conflict",
+                "PR readiness readback differs",
+            )));
+        }
+        Ok(json!({"changed":true,"pull_request":verified}))
     }
     pub async fn merge(&self, sha: &str, base: &str, method: MergeMethod) -> Result<Value> {
         branch(base)?;

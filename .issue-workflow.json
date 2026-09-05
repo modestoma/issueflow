@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "platform": "github",
+  "host": "github.com",
+  "repository": "modestoma/issueflow",
+  "remote": "origin",
+  "base_branch": "main",
+  "timezone": "Asia/Shanghai",
+  "verification_commands": [
+    "cargo fmt --check",
+    "cargo test",
+    "cargo clippy --all-targets -- -D warnings"
+  ],
+  "manual_acceptance": [],
+  "delivery_policy": "merged",
+  "delivery_condition": "User-approved PR merged into the issue's contracted target branch; additional explicitly required acceptance must still be completed.",
+  "permissions": {
+    "local_commit": true,
+    "push": true,
+    "pull_request": true
+  },
+  "github_project_url": "https://github.com/users/modestoma/projects/1",
+  "branch_prefixes": {
+    "feature": "feat",
+    "improvement": "feat",
+    "bug": "fix",
+    "refactor": "refactor",
+    "docs": "docs",
+    "chore": "chore",
+    "research": "research"
+  }
+}
