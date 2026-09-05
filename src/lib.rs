@@ -3,6 +3,7 @@ pub mod branch_contract;
 pub mod cleanup;
 pub mod config;
 pub mod error;
+pub mod hierarchy;
 pub mod project;
 pub mod pull;
 pub mod pull_checks;

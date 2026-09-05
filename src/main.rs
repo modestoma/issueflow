@@ -30,6 +30,9 @@ struct Cli {
 enum Command {
     /// Inspect installed command capabilities without loading credentials
     Capabilities,
+    /// Read and maintain native parent/child relationships
+    #[command(subcommand)]
+    Hierarchy(HierarchyCommand),
     /// Read and initialize GitLab project issue boards
     #[command(subcommand)]
     Board(BoardCommand),
@@ -51,6 +54,24 @@ enum Command {
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+}
+
+#[derive(Subcommand)]
+enum HierarchyCommand {
+    Parent {
+        issue_url: String,
+    },
+    Children {
+        issue_url: String,
+    },
+    AddChild {
+        parent_url: String,
+        child_url: String,
+    },
+    RemoveChild {
+        parent_url: String,
+        child_url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -390,6 +411,35 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         return Ok(
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
+    }
+    if let Command::Hierarchy(command) = command {
+        let parent_url = match &command {
+            HierarchyCommand::Parent { issue_url } | HierarchyCommand::Children { issue_url } => {
+                issue_url
+            }
+            HierarchyCommand::AddChild { parent_url, .. }
+            | HierarchyCommand::RemoveChild { parent_url, .. } => parent_url,
+        };
+        let parent = issueflow::hierarchy::target_from_url(&config, parent_url)?;
+        let transport = SdkTransport::new(&config, parent.platform)?;
+        let hierarchy = issueflow::hierarchy::Hierarchy {
+            transport: &transport,
+            parent,
+        };
+        return match command {
+            HierarchyCommand::Parent { .. } => hierarchy.parent().await,
+            HierarchyCommand::Children { .. } => hierarchy.children().await,
+            HierarchyCommand::AddChild { child_url, .. } => {
+                hierarchy
+                    .add_child(&issueflow::hierarchy::target_from_url(&config, &child_url)?)
+                    .await
+            }
+            HierarchyCommand::RemoveChild { child_url, .. } => {
+                hierarchy
+                    .remove_child(&issueflow::hierarchy::target_from_url(&config, &child_url)?)
+                    .await
+            }
+        };
     }
     if let Command::Board(command) = command {
         let target = Target::defaults(&config)?;
