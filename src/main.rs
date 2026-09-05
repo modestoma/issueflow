@@ -47,6 +47,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PullCommand {
+    /// Inspect checks and review evidence for the current PR head
+    Checks {
+        url: String,
+    },
     List {
         #[arg(long)]
         head: Option<String>,
@@ -213,9 +217,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         let target = match &command {
             PullCommand::List { .. } => Target::defaults(&config)?,
             PullCommand::Create { issue_url, .. } => Target::from_url(&config, issue_url)?,
-            PullCommand::Show { url } | PullCommand::Merge { url, .. } => {
-                target_from_url(&config, url)?
-            }
+            PullCommand::Show { url }
+            | PullCommand::Merge { url, .. }
+            | PullCommand::Checks { url } => target_from_url(&config, url)?,
         };
         if target.platform != issueflow::config::Platform::Github {
             return Err(Error::new("input", "PR commands support GitHub only"));
@@ -230,6 +234,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 service.list(head.as_deref(), base.as_deref()).await
             }
             PullCommand::Show { .. } => service.show().await,
+            PullCommand::Checks { .. } => {
+                issueflow::pull_checks::inspect(&transport, service.target).await
+            }
             PullCommand::Create { issue_url, file } => {
                 service.create(input(&file)?, &issue_url).await
             }
