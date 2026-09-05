@@ -131,11 +131,25 @@ For a board using these stages, the recommended workflow mapping is:
 | Awaiting review or human acceptance | In review |
 | Accepted and delivered | Done |
 
-Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. The CLI does not create fields or options. Keep type, priority, and blocked labels independently.
+Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. Status option initialization is available explicitly through `project init-statuses`; routine status changes do not create fields or options. Keep type, priority, and blocked labels independently.
 
 Projects-backed GitHub workflows should use `project status` as the stage store instead of calling the label-based `issue transition`. `issue transition` remains label-based. For Project-backed workflows, close/reopen with `--no-workflow-labels` to change only native issue state and preserve all labels; update Project Status separately. This option also leaves resolution labels unchanged, so reconcile termination reasons explicitly when needed. Without the flag, existing close/reopen label behavior remains unchanged.
 
 **Project Status and issue state are separate.** The CLI does not send issue-close mutations when changing Status. However, GitHub Project automations can close issues or overwrite Status when items change. Inspect the Project's Workflows settings before using live status writes; disable automatic closure if it would bypass human acceptance. Moving a card does not launch Codex or authorize merging or deployment.
+
+### Project onboarding
+
+```sh
+issueflow project list --owner modestoma
+issueflow project create --owner modestoma --title 'My workflow'
+issueflow project init-statuses https://github.com/users/modestoma/projects/2
+```
+
+Use `--owner-type organization` for an organization. `list` reads all visible Projects for the explicit owner. `create` reuses a unique open Project with the exact title, rejects ambiguous/closed matches, or creates a new Project and verifies it by its returned ID/number. No mutation is automatically retried. Title lookup is best-effort reuse, not an atomic idempotency guarantee; after an unknown outcome inspect the owner's Project list before any new create attempt.
+
+`init-statuses` adds missing `Backlog`, `Ready`, `In progress`, `In review`, `Done`, and `Cancelled` options to the existing Status field. It preserves existing option IDs, names, colors and descriptions (including unused default options), rejects ambiguous or closed Projects, checks for intervening field changes, and reads back the result. Existing card values should remain attached to the same option IDs. The API updates the complete option list, so concurrent edits between the final check and write can still race; this is not a transaction. Existing workflows and view layouts are not modified; choose a Board view in GitHub when needed. Review automation settings separately before using the board.
+
+After successful readback, record the selected URL as `github_project_url` in the repository's secret-free `.issue-workflow.json` and run `workflow validate`. Do not save guessed URLs or create a new Project merely because an existing one is inaccessible. The CLI does not automatically overwrite local configuration or provision every repository; these commands are explicit onboarding actions.
 
 ### Projects authentication and failure handling
 

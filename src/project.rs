@@ -124,6 +124,187 @@ impl Projects<'_> {
         }
         Ok(v["data"].clone())
     }
+    pub async fn owner_projects(&self) -> Result<Value> {
+        let q = format!(
+            "query($owner:String!,$after:String){{owner:{}(login:$owner){{id projectsV2(first:100,after:$after){{nodes{{id number title url closed}} pageInfo{{hasNextPage endCursor}}}}}}}}",
+            self.target.kind
+        );
+        let mut after = Value::Null;
+        let mut ids = BTreeSet::new();
+        let mut cursors = BTreeSet::new();
+        let mut all = Vec::new();
+        for _ in 0..1000 {
+            let v = self
+                .graphql(&q, json!({"owner":self.target.owner,"after":after}), false)
+                .await?;
+            let owner = &v["owner"];
+            if owner.is_null() {
+                return Err(Error::new(
+                    "not_found",
+                    "Project owner not found or not visible",
+                ));
+            }
+            let owner_id = string(owner, "id")?;
+            let c = &owner["projectsV2"];
+            for p in c["nodes"].as_array().ok_or_else(response_error)? {
+                if !ids.insert(string(p, "id")?.to_owned()) {
+                    return Err(Error::new("conflict", "Projects changed during pagination"));
+                }
+                all.push(p.clone());
+            }
+            if !c["pageInfo"]["hasNextPage"]
+                .as_bool()
+                .ok_or_else(response_error)?
+            {
+                return Ok(json!({"owner_id":owner_id,"projects":all}));
+            }
+            let cursor = string(&c["pageInfo"], "endCursor")?;
+            if !cursors.insert(cursor.to_owned()) {
+                return Err(response_error());
+            }
+            after = json!(cursor);
+        }
+        Err(Error::new("response", "Project pagination limit exceeded"))
+    }
+    pub async fn create(&self, title: &str) -> Result<Value> {
+        if title.trim().is_empty() {
+            return Err(Error::new("input", "Project title cannot be empty"));
+        }
+        let list = self.owner_projects().await?;
+        let matches: Vec<_> = list["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["title"].as_str() == Some(title))
+            .collect();
+        if matches.len() > 1 {
+            return Err(Error::new(
+                "conflict",
+                "Multiple Projects share this title; choose a URL explicitly",
+            ));
+        }
+        let (result, reused) = if let Some(p) = matches.first() {
+            if p["closed"] != false {
+                return Err(Error::new(
+                    "conflict",
+                    "Matching Project is closed; choose another title or reopen it explicitly",
+                ));
+            }
+            ((*p).clone(), true)
+        } else {
+            let v=self.graphql("mutation($owner:ID!,$title:String!){createProjectV2(input:{ownerId:$owner,title:$title}){projectV2{id number title url closed}}}",json!({"owner":string(&list,"owner_id")?,"title":title}),true).await?;
+            (v["createProjectV2"]["projectV2"].clone(), false)
+        };
+        let verify = async {
+            let number = result["number"]
+                .as_i64()
+                .filter(|n| *n > 0 && *n <= i32::MAX as i64)
+                .ok_or_else(response_error)? as i32;
+            let p = Projects {
+                transport: self.transport,
+                target: ProjectTarget {
+                    owner: self.target.owner.clone(),
+                    kind: self.target.kind,
+                    number,
+                },
+            }
+            .show()
+            .await?;
+            if p["id"] != result["id"] || p["title"].as_str() != Some(title) {
+                return Err(Error::new("conflict", "Created Project readback differs"));
+            }
+            Ok(json!({"reused":reused,"project":p}))
+        }
+        .await;
+        if reused {
+            verify
+        } else {
+            verify.map_err(after_write)
+        }
+    }
+    pub async fn init_statuses(&self) -> Result<Value> {
+        let before = self.show().await?;
+        if before["closed"] != false {
+            return Err(Error::new("input", "Cannot initialize a closed Project"));
+        }
+        let fields = before["fields"].as_array().ok_or_else(response_error)?;
+        let candidates: Vec<_> = fields
+            .iter()
+            .filter(|f| f["name"] == "Status" && f["options"].is_array())
+            .collect();
+        if candidates.len() != 1 {
+            return Err(Error::new(
+                "input",
+                "Expected exactly one existing Status single-select field",
+            ));
+        }
+        let field = candidates[0];
+        let old = field["options"].as_array().unwrap();
+        let desired = [
+            ("Backlog", "GRAY"),
+            ("Ready", "BLUE"),
+            ("In progress", "YELLOW"),
+            ("In review", "PURPLE"),
+            ("Done", "GREEN"),
+            ("Cancelled", "GRAY"),
+        ];
+        let mut options = Vec::new();
+        let mut names = BTreeSet::new();
+        for o in old {
+            let name = string(o, "name")?;
+            if !names.insert(name.to_owned()) {
+                return Err(Error::new("conflict", "Ambiguous duplicate Status options"));
+            }
+            options.push(json!({"id":string(o,"id")?,"name":name,"color":string(o,"color")?,"description":o["description"].as_str().unwrap_or("")}));
+        }
+        let mut added = Vec::new();
+        for (name, color) in desired {
+            if !names.contains(name) {
+                options.push(json!({"name":name,"color":color,"description":""}));
+                added.push(name);
+            }
+        }
+        if added.is_empty() {
+            return Ok(json!({"changed":false,"project":before}));
+        }
+        let latest = self.show().await?;
+        if latest["fields"] != before["fields"] {
+            return Err(Error::new(
+                "conflict",
+                "Project fields changed before initialization; inspect again",
+            ));
+        }
+        self.graphql("mutation($field:ID!,$options:[ProjectV2SingleSelectFieldOptionInput!]!){updateProjectV2Field(input:{fieldId:$field,singleSelectOptions:$options}){projectV2Field{... on ProjectV2SingleSelectField{id}}}}",json!({"field":string(field,"id")?,"options":options}),true).await?;
+        let verified = self.show().await.map_err(after_write)?;
+        let check = || -> Result<()> {
+            let fields = verified["fields"].as_array().ok_or_else(response_error)?;
+            let found = fields
+                .iter()
+                .find(|f| f["id"] == field["id"])
+                .ok_or_else(response_error)?;
+            let actual = found["options"].as_array().ok_or_else(response_error)?;
+            for expected in &options {
+                let found: Vec<_> = actual
+                    .iter()
+                    .filter(|o| o["name"] == expected["name"])
+                    .collect();
+                if found.len() != 1 {
+                    return Err(response_error());
+                }
+                if let Some(id) = expected.get("id")
+                    && (found[0]["id"] != *id
+                        || found[0]["color"] != expected["color"]
+                        || found[0]["description"].as_str().unwrap_or("")
+                            != expected["description"].as_str().unwrap_or(""))
+                {
+                    return Err(response_error());
+                }
+            }
+            Ok(())
+        };
+        check().map_err(after_write)?;
+        Ok(json!({"changed":true,"added":added,"project":verified}))
+    }
     pub async fn show(&self) -> Result<Value> {
         let q = format!(
             "query($owner:String!,$number:Int!){{owner:{}(login:$owner){{projectV2(number:$number){{id title url closed}}}}}}",
@@ -149,7 +330,7 @@ impl Projects<'_> {
     }
     async fn connection(&self, id: &str, field: &str) -> Result<Vec<Value>> {
         let selection = if field == "fields" {
-            "... on ProjectV2FieldCommon { id name } ... on ProjectV2SingleSelectField { options { id name } }"
+            "... on ProjectV2FieldCommon { id name } ... on ProjectV2SingleSelectField { options { id name color description } }"
         } else {
             "id isArchived content { __typename ... on Issue { id url title state } ... on PullRequest { id url title } ... on DraftIssue { id title } } fieldValueByName(name:\"Status\") { ... on ProjectV2ItemFieldSingleSelectValue { name optionId } }"
         };
