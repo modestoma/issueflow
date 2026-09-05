@@ -159,7 +159,7 @@ impl Boards<'_> {
             let id = list["id"]
                 .as_u64()
                 .ok_or_else(|| Error::new("response", "GitLab board list has no id"))?;
-            let position = (index + 1) as u64;
+            let position = index as u64;
             if list["position"].as_u64() != Some(position) {
                 self.transport
                     .request(
@@ -179,7 +179,7 @@ impl Boards<'_> {
                 .iter()
                 .filter(|list| {
                     list["label"]["name"].as_str() == Some(*label)
-                        && list["position"].as_u64() == Some((index + 1) as u64)
+                        && list["position"].as_u64() == Some(index as u64)
                 })
                 .count()
                 != 1
