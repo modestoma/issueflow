@@ -178,6 +178,15 @@ impl ProjectOwner {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
+    /// List native repository links
+    Repositories {
+        url: String,
+    },
+    /// Link this Project to an explicit owner/repository, with readback
+    LinkRepository {
+        url: String,
+        repository: String,
+    },
     Views {
         url: String,
     },
@@ -478,7 +487,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                     owner
                 ),
             )?,
-            ProjectCommand::Show { url }
+            ProjectCommand::Repositories { url }
+            | ProjectCommand::LinkRepository { url, .. }
+            | ProjectCommand::Show { url }
             | ProjectCommand::Items { url }
             | ProjectCommand::InitStatuses { url }
             | ProjectCommand::InitWorkflow { url }
@@ -505,6 +516,10 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             target,
         };
         return match command {
+            ProjectCommand::Repositories { .. } => service.repositories().await,
+            ProjectCommand::LinkRepository { repository, .. } => {
+                service.link_repository(&repository).await
+            }
             ProjectCommand::Show { .. } => service.show().await,
             ProjectCommand::List { .. } => service.owner_projects().await,
             ProjectCommand::Create { title, .. } => service.create(&title).await,

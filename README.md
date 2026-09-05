@@ -365,3 +365,14 @@ cargo clippy --all-targets -- -D warnings
 Automated tests cover configuration, credential redaction, URL handling, pagination, write mappings, duplicate detection, state changes, and dependency rules. Local HTTP servers verify both SDKs' authentication headers, base paths, JSON handling, empty `204` responses, redirects, and rate limiting. These tests do not write to real repositories.
 
 Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. Live validation against Jihu GitLab v18.4.6-jh is still pending.
+
+### Native Project repository links
+
+After creating or selecting the workflow Project, establish its native repository link before saving onboarding configuration:
+
+```sh
+issueflow --no-env-file project link-repository PROJECT_URL OWNER/REPOSITORY
+issueflow --no-env-file project repositories PROJECT_URL
+```
+
+The link makes the Project accessible from the repository's Projects entry. It is separate from adding an issue to a Project and from recording `github_project_url` locally. Existing links are reused without mutation; other repository links are preserved. Both commands paginate links. Linking reads back the association and reports unknown outcomes without retrying mutations. A failed link does not undo successful Project creation: inspect and resume using the existing Project URL. Project creation remains an explicit owner-scoped operation. The API is documented in [GitHub's Projects reference](https://docs.github.com/en/graphql/reference/projects#linkprojectv2torepository).

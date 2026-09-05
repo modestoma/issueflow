@@ -240,6 +240,86 @@ impl Projects<'_> {
             verify.map_err(after_write)
         }
     }
+    /// Read native repository links, independently of issue membership.
+    pub async fn repositories(&self) -> Result<Value> {
+        let project = self.show().await?;
+        let repositories = self.linked_repositories(string(&project, "id")?).await?;
+        Ok(json!({"project":project["url"],"repositories":repositories}))
+    }
+    async fn linked_repositories(&self, project: &str) -> Result<Vec<Value>> {
+        let mut after = Value::Null;
+        let mut ids = BTreeSet::new();
+        let mut cursors = BTreeSet::new();
+        let mut all = Vec::new();
+        for _ in 0..1000 {
+            let v = self.graphql("query($id:ID!,$after:String){node(id:$id){... on ProjectV2{repositories(first:100,after:$after){nodes{id nameWithOwner url} pageInfo{hasNextPage endCursor}}}}}", json!({"id":project,"after":after}), false).await?;
+            let c = &v["node"]["repositories"];
+            for repo in c["nodes"].as_array().ok_or_else(response_error)? {
+                if !ids.insert(string(repo, "id")?.to_owned()) {
+                    return Err(Error::new(
+                        "conflict",
+                        "Repository links changed during pagination",
+                    ));
+                }
+                string(repo, "nameWithOwner")?;
+                string(repo, "url")?;
+                all.push(repo.clone());
+            }
+            match c["pageInfo"]["hasNextPage"].as_bool() {
+                Some(false) => return Ok(all),
+                Some(true) => {}
+                None => return Err(response_error()),
+            }
+            let cursor = string(&c["pageInfo"], "endCursor")?;
+            if !cursors.insert(cursor.to_owned()) {
+                return Err(response_error());
+            }
+            after = json!(cursor);
+        }
+        Err(response_error())
+    }
+    pub async fn link_repository(&self, repository: &str) -> Result<Value> {
+        if !crate::target::valid_repository(repository, Platform::Github) {
+            return Err(Error::new("input", "Use an explicit owner/repository name"));
+        }
+        let project = self.show().await?;
+        if project["closed"] != false {
+            return Err(Error::new("input", "Cannot link a closed Project"));
+        }
+        let pid = string(&project, "id")?;
+        let (owner, name) = repository.split_once('/').ok_or_else(response_error)?;
+        let v = self.graphql("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id nameWithOwner url}}", json!({"owner":owner,"name":name}), false).await?;
+        let repo = &v["repository"];
+        if repo.is_null() {
+            return Err(Error::new(
+                "not_found",
+                "Repository not found or not visible",
+            ));
+        }
+        let rid = string(repo, "id")?;
+        if !string(repo, "nameWithOwner")?.eq_ignore_ascii_case(repository) {
+            return Err(Error::new(
+                "conflict",
+                "Resolved repository differs from the requested repository",
+            ));
+        }
+        let before = self.linked_repositories(pid).await?;
+        if before.iter().any(|r| r["id"] == rid) {
+            return Ok(json!({"changed":false,"project":project["url"],"repository":repo}));
+        }
+        self.graphql("mutation($project:ID!,$repository:ID!){linkProjectV2ToRepository(input:{projectId:$project,repositoryId:$repository}){repository{id}}}", json!({"project":pid,"repository":rid}), true).await?;
+        let after = self.linked_repositories(pid).await.map_err(after_write)?;
+        if !after
+            .iter()
+            .any(|r| r["id"] == rid && r["nameWithOwner"] == repo["nameWithOwner"])
+        {
+            return Err(after_write(Error::new(
+                "conflict",
+                "Repository link readback differs; inspect before retrying",
+            )));
+        }
+        Ok(json!({"changed":true,"project":project["url"],"repository":repo}))
+    }
     pub async fn init_statuses(&self) -> Result<Value> {
         let desired = [
             ("Backlog", "GRAY"),
