@@ -30,7 +30,7 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub branch_prefixes: HashMap<String, String>,
 }
-#[derive(Deserialize, serde::Serialize, Default)]
+#[derive(Deserialize, serde::Serialize, Default, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryPolicy {
     Merged,

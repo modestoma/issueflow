@@ -4,6 +4,7 @@ pub mod error;
 pub mod project;
 pub mod pull;
 pub mod pull_checks;
+pub mod recovery;
 pub mod service;
 pub mod target;
 pub mod transport;
