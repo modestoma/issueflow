@@ -38,6 +38,17 @@ pub struct Plan {
     pub actions: Vec<&'static str>,
     pub blockers: Vec<&'static str>,
 }
+impl Plan {
+    fn allows(&self, action: &str) -> bool {
+        self.actions.contains(&action)
+            && (self.blockers.is_empty()
+                || (self
+                    .blockers
+                    .iter()
+                    .all(|reason| *reason == "human_acceptance_required")
+                    && matches!(action, "add_to_project" | "set_project_done")))
+    }
+}
 pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
     let stop = |phase, reason| Plan {
         phase,
@@ -88,9 +99,6 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
     if !s.delivered {
         return stop("delivery_pending", "merge_not_reachable_from_target");
     }
-    if matches!(policy, DeliveryPolicy::AcceptanceRequired) && !accepted {
-        return stop("acceptance_pending", "human_acceptance_required");
-    }
     if s.project_configured && !s.done_option_available {
         return stop("manual_review", "project_done_option_missing_or_ambiguous");
     }
@@ -102,6 +110,13 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
         if s.project_status.as_deref() != Some("Done") {
             actions.push("set_project_done");
         }
+    }
+    if matches!(policy, DeliveryPolicy::AcceptanceRequired) && !accepted {
+        return Plan {
+            phase: "acceptance_pending",
+            actions,
+            blockers: vec!["human_acceptance_required"],
+        };
     }
     if s.resolution.as_deref() != Some("Completed") {
         actions.push("set_resolution_completed");
@@ -348,7 +363,12 @@ impl Recovery<'_> {
                 "PR head differs from approved recovery expectation",
             ));
         }
-        if !proposal.blockers.is_empty() {
+        if proposal.actions.is_empty()
+            || proposal
+                .actions
+                .iter()
+                .any(|action| !proposal.allows(action))
+        {
             return Ok(json!({"applied":false,"snapshot":before,"plan":proposal}));
         }
         let mut completed = Vec::new();
@@ -358,7 +378,11 @@ impl Recovery<'_> {
                 .inspect(accepted)
                 .await
                 .map_err(|e| partial(e, &completed))?;
-            if latest.head_sha.as_deref() != Some(expected) || !p.blockers.is_empty() {
+            if latest.head_sha.as_deref() != Some(expected)
+                || p.blockers
+                    .iter()
+                    .any(|reason| *reason != "human_acceptance_required")
+            {
                 return Err(partial(
                     Error::new(
                         "conflict",
@@ -369,6 +393,15 @@ impl Recovery<'_> {
             }
             if !p.actions.contains(action) {
                 continue;
+            }
+            if !p.allows(action) {
+                return Err(partial(
+                    Error::new(
+                        "conflict",
+                        "Action requires acceptance; inspect before continuing",
+                    ),
+                    &completed,
+                ));
             }
             let result = match *action {
                 "add_to_project" => self.project()?.ok_or_else(bad)?.add(&self.target()?).await,
@@ -401,7 +434,12 @@ impl Recovery<'_> {
             .inspect(accepted)
             .await
             .map_err(|e| partial(e, &completed))?;
-        if !remaining.actions.is_empty() || !remaining.blockers.is_empty() {
+        if !remaining.actions.is_empty()
+            || remaining
+                .blockers
+                .iter()
+                .any(|reason| *reason != "human_acceptance_required")
+        {
             return Err(partial(
                 Error::new(
                     "conflict",
