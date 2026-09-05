@@ -1,0 +1,23 @@
+[package]
+name = "issueflow"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+http = "1"
+octocrab = { version = "=0.54.1", default-features = false, features = ["default-client", "rustls", "rustls-ring", "jwt-rust-crypto"] }
+gitlab = "=0.1804.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+bytes = "1"
+http-body-util = "0.1"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
