@@ -378,10 +378,46 @@ impl Recovery<'_> {
                     s.delivered = matches!(compare["status"].as_str(), Some("ahead" | "identical"))
                         && compare["merge_base_commit"]["sha"].as_str() == Some(merge);
                 } else {
-                    s.delivered = pr["target_branch"] == self.contract.pr_target
-                        && pr["merge_commit_sha"]
-                            .as_str()
-                            .is_some_and(|v| sha(&json!(v)).is_ok());
+                    let merge = sha(&pr["merge_commit_sha"])?;
+                    let root = format!(
+                        "projects/{}/repository/commits/{}/refs?type=branch",
+                        encode(&t.repository),
+                        encode(merge)
+                    );
+                    let mut names = std::collections::BTreeSet::new();
+                    for page in 1..=1000 {
+                        let refs = self
+                            .transport
+                            .request(
+                                Method::GET,
+                                &format!("{root}&per_page=100&page={page}"),
+                                None,
+                            )
+                            .await?;
+                        let refs = refs.as_array().ok_or_else(bad)?;
+                        for reference in refs {
+                            if reference["type"] != "branch" {
+                                return Err(bad());
+                            }
+                            let name = reference["name"].as_str().ok_or_else(bad)?;
+                            if !names.insert(name.to_string()) {
+                                return Err(Error::new(
+                                    "conflict",
+                                    "GitLab commit references changed during pagination",
+                                ));
+                            }
+                        }
+                        if refs.len() < 100 {
+                            break;
+                        }
+                        if page == 1000 {
+                            return Err(Error::new(
+                                "response",
+                                "GitLab commit reference pagination limit exceeded",
+                            ));
+                        }
+                    }
+                    s.delivered = names.contains(&self.contract.pr_target);
                 }
             }
         }

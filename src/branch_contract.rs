@@ -13,13 +13,7 @@ fn config_for_url(value: &str) -> Result<Config> {
     if value.contains("/-/issues/") || value.contains("/-/merge_requests/") {
         environment.insert(
             "ISSUEFLOW_GITLAB_URL".into(),
-            format!(
-                "{}://{}",
-                parsed.scheme(),
-                parsed
-                    .host_str()
-                    .ok_or_else(|| Error::new("input", "Invalid GitLab host in branch contract"))?
-            ),
+            parsed.origin().ascii_serialization(),
         );
     }
     Config::resolve(HashMap::new(), environment, Overrides::default()).map_err(Error::from)

@@ -108,6 +108,25 @@ fn validates_configured_gitlab_mr_url() {
         .is_err()
     );
 }
+
+#[test]
+fn validates_gitlab_mr_url_with_non_default_port() {
+    let config = Config::resolve(
+        HashMap::new(),
+        HashMap::from([(
+            "ISSUEFLOW_GITLAB_URL".into(),
+            "https://gitlab.example:8443".into(),
+        )]),
+        Overrides::default(),
+    )
+    .unwrap();
+    let target = target_from_url(
+        &config,
+        "https://gitlab.example:8443/group/repo/-/merge_requests/9",
+    )
+    .unwrap();
+    assert_eq!(target.repository, "group/repo");
+}
 #[tokio::test]
 async fn gitlab_create_maps_fields_and_reads_back() {
     let m = Mock::new(vec![

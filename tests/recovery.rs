@@ -171,6 +171,9 @@ fn gitlab_completed_issue() -> Value {
 fn gitlab_mr() -> Value {
     json!({"id":2,"iid":2,"web_url":"https://gitlab.example/group/sub/repo/-/merge_requests/2","state":"merged","merged_at":"now","draft":false,"sha":"a".repeat(40),"source_branch":"feat/change","target_branch":"main","source_project_id":7,"target_project_id":7,"merge_commit_sha":"b".repeat(40),"description":"Refs https://gitlab.example/group/sub/repo/-/issues/1"})
 }
+fn gitlab_target_refs() -> Value {
+    json!([{"type":"branch","name":"main"}])
+}
 fn workflow() -> WorkflowConfig {
     serde_json::from_value(json!({"schema_version":1,"platform":"github","host":"github.com","repository":"a/b","remote":"origin","base_branch":"main","timezone":"Asia/Shanghai","delivery_policy":"merged","github_project_url":"https://github.com/users/a/projects/1","permissions":{"local_commit":true,"push":true}})).unwrap()
 }
@@ -219,7 +222,14 @@ async fn default_reconcile_only_reads() {
 #[tokio::test]
 async fn gitlab_merged_delivery_plans_close_without_project_requests() {
     let m = Mock {
-        steps: Mutex::new(vec![(Method::GET, gitlab_issue()), (Method::GET, gitlab_mr())].into()),
+        steps: Mutex::new(
+            vec![
+                (Method::GET, gitlab_issue()),
+                (Method::GET, gitlab_mr()),
+                (Method::GET, gitlab_target_refs()),
+            ]
+            .into(),
+        ),
         calls: Mutex::new(vec![]),
     };
     let cfg = gitlab_cfg();
@@ -250,7 +260,14 @@ async fn gitlab_merged_delivery_plans_close_without_project_requests() {
 #[tokio::test]
 async fn gitlab_acceptance_policy_never_closes_from_merge_alone() {
     let m = Mock {
-        steps: Mutex::new(vec![(Method::GET, gitlab_issue()), (Method::GET, gitlab_mr())].into()),
+        steps: Mutex::new(
+            vec![
+                (Method::GET, gitlab_issue()),
+                (Method::GET, gitlab_mr()),
+                (Method::GET, gitlab_target_refs()),
+            ]
+            .into(),
+        ),
         calls: Mutex::new(vec![]),
     };
     let cfg = gitlab_cfg();
@@ -274,8 +291,16 @@ async fn gitlab_acceptance_policy_never_closes_from_merge_alone() {
 async fn gitlab_apply_closes_once_after_expected_head_and_reads_back() {
     let completed = gitlab_completed_issue();
     let completed_open = json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"opened","labels":["type::feature","priority::P1","workflow::已完成"]});
-    let mut steps = vec![(Method::GET, gitlab_issue()), (Method::GET, gitlab_mr())];
-    steps.extend([(Method::GET, gitlab_issue()), (Method::GET, gitlab_mr())]);
+    let mut steps = vec![
+        (Method::GET, gitlab_issue()),
+        (Method::GET, gitlab_mr()),
+        (Method::GET, gitlab_target_refs()),
+    ];
+    steps.extend([
+        (Method::GET, gitlab_issue()),
+        (Method::GET, gitlab_mr()),
+        (Method::GET, gitlab_target_refs()),
+    ]);
     steps.extend([
         (Method::GET, gitlab_issue()),
         (Method::GET, gitlab_issue()),
@@ -284,7 +309,11 @@ async fn gitlab_apply_closes_once_after_expected_head_and_reads_back() {
         (Method::GET, completed_open),
         (Method::PUT, completed.clone()),
     ]);
-    steps.extend([(Method::GET, completed), (Method::GET, gitlab_mr())]);
+    steps.extend([
+        (Method::GET, completed),
+        (Method::GET, gitlab_mr()),
+        (Method::GET, gitlab_target_refs()),
+    ]);
     let m = Mock {
         steps: Mutex::new(steps.into()),
         calls: Mutex::new(vec![]),

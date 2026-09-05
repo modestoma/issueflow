@@ -353,6 +353,8 @@ impl issueflow::transport::Transport for GitlabCleanupRemote {
             json!({"id":1,"iid":1,"title":"Issue","description":"Body","created_at":"now","updated_at":"now","web_url":"https://gitlab.example/group/repo/-/issues/1","state":"opened","labels":["type::feature","priority::P1","workflow::待验收"]})
         } else if endpoint == "projects/group%2Frepo/merge_requests/2" {
             json!({"id":2,"iid":2,"web_url":"https://gitlab.example/group/repo/-/merge_requests/2","state":"merged","merged_at":"now","draft":false,"sha":self.head,"source_branch":"feat/issue-1","target_branch":"main","source_project_id":7,"target_project_id":7,"merge_commit_sha":"b".repeat(40),"description":"Refs https://gitlab.example/group/repo/-/issues/1"})
+        } else if endpoint.starts_with("projects/group%2Frepo/repository/commits/") {
+            json!([{"type":"branch","name":"main"}])
         } else if endpoint.starts_with("projects/group%2Frepo/merge_requests?state=opened") {
             json!([])
         } else {
