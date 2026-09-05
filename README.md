@@ -1,17 +1,19 @@
 # issueflow
 
-Rust 编写的 GitHub / GitLab issue 维护 CLI。通过 SDK 直接访问 API，不依赖 `gh`、`glab` 或 Python。
+A Rust CLI for managing GitHub and GitLab issues. It accesses platform APIs directly through SDKs, without requiring `gh`, `glab`, or Python.
 
-已实现 issue 读取、创建、更新、评论、标记、关闭／重开、阶段流转和原生阻塞依赖管理。GitHub 使用 `octocrab =0.54.1`，GitLab 使用 `gitlab =0.1804.0` 的 endpoint/query 扩展接口，并提供受控 HTTP 客户端，支持实例基础路径、超时和禁止重定向。SDK 不覆盖的端点通过同一适配器调用。开发本 CLI 期间不使用 issue-workflow 工作流。
+Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; and managing native blocking dependencies. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. Development of this CLI does not use the issue-workflow workflow.
 
-## 构建与使用
+## Build and usage
 
 ```sh
 cargo build --release
 ./target/release/issueflow --help
 ```
 
-配置凭据后，先做只读连通检查；`doctor` 只验证身份，不声称拥有项目写权限：
+The examples below assume the built executable is available as `issueflow` on your `PATH`. You can also use `./target/release/issueflow` from the repository root.
+
+After configuring credentials, start with a read-only connectivity check. `doctor` verifies authentication only; it does not establish repository write permissions:
 
 ```sh
 issueflow --platform github doctor
@@ -21,18 +23,18 @@ issueflow issue show https://github.com/owner/repo/issues/42 --comments
 issueflow issue comments https://gitlab.example.com/group/repo/-/issues/42
 ```
 
-详情操作以 URL 的平台、仓库和原生编号为准，覆盖默认目标；主机必须与对应 API 配置匹配，绝不向未配置主机发送凭据。GitHub Enterprise 的网页主机从自定义 API URL 推导。GitLab 支持多级组和实例基础路径。不分配自定义 issue 编号，日期可直接写入标题。
+Operations on a specific issue use the platform, repository, and native issue number from its URL, overriding the default target. The host must match the corresponding API configuration; credentials are never sent to unconfigured hosts. The GitHub Enterprise web host is inferred from the custom API URL. GitLab supports nested groups and instance base paths. No custom issue numbers are assigned; dates can be included directly in titles.
 
-`issue list` 返回全部可见的开放与关闭 issue，排除 GitHub PR。数组 API 完整分页读取，上限 100000 条，超过上限或中途失败不会返回伪装完整的结果。
+`issue list` returns all visible open and closed issues, excluding GitHub pull requests. Array endpoints are paginated up to 100,000 items. Exceeding this limit or encountering a failure during pagination produces an error rather than presenting partial results as complete.
 
-### 创建与更新
+### Create and update
 
-`issue.json` 示例：
+Example `issue.json`:
 
 ```json
 {
-  "title": "[20260905] 改善错误提示",
-  "body": "## 背景\n…\n\n## 验收标准\n- [ ] …",
+  "title": "[20260905] Improve error messages",
+  "body": "## Background\n…\n\n## Acceptance criteria\n- [ ] …",
   "labels": ["type::improvement", "workflow::待复查", "priority::P2"]
 }
 ```
@@ -44,15 +46,15 @@ issueflow issue update https://github.com/owner/repo/issues/42 --file changes.js
 issueflow issue comment https://github.com/owner/repo/issues/42 --file progress.md
 ```
 
-`changes.json` 只接受 `title`、`body`，仅更新出现的非 null 字段；空字符串 body 可清空正文（保留内部重试标记）。正文文件按 UTF-8 读取，`--file -` 从标准输入读取。创建 JSON 只接受 title/body/labels，未知字段报错。
+`changes.json` accepts only `title` and `body`. Only supplied, non-null fields are updated. An empty body clears the description while preserving internal retry markers. Input files are read as UTF-8; `--file -` reads standard input. Creation JSON accepts only `title`, `body`, and `labels`; unknown fields are rejected.
 
-创建时正文附带 operation UUID 注释；输出包含 operation、原生编号、URL。可用 `--request-id UUID` 显式指定同一逻辑请求。重试会查询全部可见 issue：已有相同 request-id 且内容一致时返回原单，内容不同或多个匹配则报冲突。没有本地登记文件。
+Creation appends an operation UUID comment to the body. The output includes the operation, native issue number, and URL. Use `--request-id UUID` to explicitly identify the same logical request. A retry scans all visible issues: an existing request ID with matching content reuses the issue, while different content or multiple matches produce a conflict. No local registry file is maintained.
 
-**这不是服务端幂等保证**：并发使用相同 UUID、权限不完整、删除标记或短暂不可见仍可能重复。写入超时会报告 `outcome_unknown: true` 和 request-id；先核对远端，不盲目重发。所有请求均不自动重试、不跟随重定向。请求成功响应无法解析时也不声称写入未发生。
+**This is not a server-side idempotency guarantee.** Concurrent use of the same UUID, incomplete visibility, removed markers, or temporary listing delays can still cause duplicates. A write timeout reports `outcome_unknown: true` and the request ID; inspect the remote state before resending. Requests are never automatically retried and redirects are not followed. An unparseable success response is also treated as an unknown write outcome.
 
-`--expected-updated-at` 是写入前的过期检查，不是平台原子的 compare-and-swap；检查与写入之间仍存在竞争窗口。应根据最新正文合并变更。
+`--expected-updated-at` checks for stale data before writing. It is not an atomic platform compare-and-swap operation; another update can occur between the check and the write. Merge changes against the latest body.
 
-### 标记与状态
+### Labels and state
 
 ```sh
 issueflow issue labels https://github.com/owner/repo/issues/42
@@ -63,13 +65,23 @@ issueflow issue close https://github.com/owner/repo/issues/42 --reason completed
 issueflow issue reopen https://github.com/owner/repo/issues/42
 ```
 
-阶段支持 `triage`、`clarification`、`ready`、`in-progress`、`awaiting-review`，映射为中文 `workflow::…` 标记。阶段切换移除旧阶段、保留其他标记，并读回检查。关闭的 issue 必须显式 reopen 才能切换开放阶段。
+The supported stages are `triage`, `clarification`, `ready`, `in-progress`, and `awaiting-review`. They map to Chinese workflow labels used by the current implementation:
 
-关闭原因支持 `completed`、`cancelled`、`duplicate`、`invalid`：成功完成对应已完成，其他对应已终止及 resolution 标记。GitHub 非完成原因统一使用原生 `not_planned`，重复的原单 URL 应写入正文／评论。reopen 会清理旧 resolution 并回到待复查。
+| Stage | Label |
+| --- | --- |
+| `triage` | `workflow::待复查` |
+| `clarification` | `workflow::待明确` |
+| `ready` | `workflow::就绪` |
+| `in-progress` | `workflow::开发中` |
+| `awaiting-review` | `workflow::待验收` |
 
-CLI 执行显式命令，不判断人是否验收，也不自动合并或发布。`close --reason completed` 应在人工验收和交付条件满足后调用。标记与关闭涉及多个请求，不具备跨请求事务；部分成功会明确报错，按远端现状修复。`setup-labels` 仅创建缺失标记，保留现有颜色和无关标记。通用 labels 操作可直接管理标签；推荐用 transition/close/reopen 保持工作阶段与基础状态一致。
+A transition removes the previous workflow label, preserves other labels, and reads back the result for verification. A closed issue must be explicitly reopened before transitioning to an open stage.
 
-### 依赖
+Supported close reasons are `completed`, `cancelled`, `duplicate`, and `invalid`. Completion sets `workflow::已完成`; other reasons set `workflow::已终止` with a corresponding resolution label (`resolution::取消`, `resolution::重复`, or `resolution::失效`). On GitHub, all non-completion reasons use the native `not_planned` state reason. For duplicates, include the original issue URL in the body or a comment. Reopening clears old resolution labels and returns the issue to triage.
+
+The CLI executes explicit commands. It does not determine whether a human has accepted the work, and it does not automatically merge or release anything. Use `close --reason completed` after human acceptance and delivery requirements are met. Label changes and closing involve multiple requests without a shared transaction. Partial success is reported as an error; reconcile against the remote state. `setup-labels` creates missing labels while preserving existing colors and unrelated labels. The general `labels` command can manage labels directly; use `transition`, `close`, and `reopen` to keep workflow stages and native issue state consistent.
+
+### Dependencies
 
 ```sh
 issueflow issue dependencies https://github.com/owner/repo/issues/42
@@ -77,21 +89,32 @@ issueflow issue add-dependency https://github.com/owner/repo/issues/42 https://g
 issueflow issue remove-dependency https://github.com/owner/repo/issues/42 https://github.com/owner/repo/issues/40
 ```
 
-方向为第一个 issue **被第二个 issue 阻塞**。添加前遍历可达前置关系并检查循环，最多 1000 个节点。GitHub 使用 dependencies API；GitLab 使用 issue links。平台和实例必须一致，可跨项目；不支持的版本或权限返回 API 错误，不把普通 related-to 冒充阻塞。GitLab 原生阻塞关系取决于实例许可证。
+The first issue is **blocked by the second issue**. Before adding a dependency, the CLI traverses reachable blockers and checks for cycles, up to 1,000 nodes. GitHub uses the dependencies API; GitLab uses issue links. Dependencies may cross repositories but must remain on the same platform and instance. Unsupported versions or insufficient permissions produce API errors; ordinary related-to links are never presented as blocking relationships. Native GitLab blocking relationships depend on the instance license.
 
-依赖列表输出原生关系信息；不自动解锁开发或关闭 issue，因为 Closed 可能意味着取消。检查与添加之间不具备跨用户事务，远端仍是最终依据。父子层级、正文依赖降级、PR/MR 和 worktree 自动化不在本版 CLI 范围内。
+Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent-child hierarchies, fallback dependencies in issue bodies, PR/MR operations, and worktree automation are outside this version's scope.
 
-## 输出与错误
+## Output and errors
 
-成功输出 JSON 到 stdout，错误 JSON 到 stderr。issue 结果统一包含 platform、id、number、url、title、body、state、labels、created_at、updated_at；id 是平台全局 ID，number 是仓库原生编号（GitLab iid）。评论与依赖保留平台原始 JSON。
+Successful commands write JSON to stdout; errors write JSON to stderr. Normalized issue results contain `platform`, `id`, `number`, `url`, `title`, `body`, `state`, `labels`, `created_at`, and `updated_at`. `id` is the platform-wide ID; `number` is the repository's native issue number (GitLab `iid`). Comments and dependencies retain platform-native JSON.
 
-退出码：0 成功，2 输入／配置错误，3 认证／权限错误，4 找不到资源，5 冲突，1 其他 API／网络错误。服务端错误正文不会直接输出，避免意外回显凭据；HTTP 状态保留在 status 中。Clap 的命令用法错误使用标准 CLI 帮助格式。GitHub 的 403 也可能是次级限流，需要结合平台状态判断。
+Exit codes:
 
-## 配置
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `1` | Other API or network error |
+| `2` | Input or configuration error |
+| `3` | Authentication or permission error |
+| `4` | Resource not found |
+| `5` | Conflict |
 
-优先级由高到低：**显式命令参数 > 进程环境变量 > `.env` > 内置默认值**。
+Raw server error bodies are not printed, to avoid accidentally exposing credentials. The HTTP status is retained in `status`. Clap command usage errors use the standard CLI help format. A GitHub `403` can also indicate secondary rate limiting and requires interpretation in context.
 
-默认只读取当前工作目录的 `.env`，不向父目录搜索。使用 `--env-file PATH` 指定另一份文件（替代默认文件，不叠加），或 `--no-env-file` 禁用文件加载。默认 `.env` 不存在可继续，明确指定的文件缺失、文件不可读或格式错误则退出。不会修改进程环境或创建本地配置维护文件。
+## Configuration
+
+Precedence, from highest to lowest: **explicit CLI flags > process environment variables > `.env` > built-in defaults**.
+
+By default, only `.env` in the current working directory is loaded; parent directories are not searched. Use `--env-file PATH` to select a different file (replacing the default, not layering on top), or `--no-env-file` to disable file loading. A missing default `.env` is allowed. An explicitly selected file that is missing, unreadable, or malformed causes an error. Loading configuration does not mutate the process environment or create local configuration registry files.
 
 ```sh
 cp .env.example .env
@@ -100,23 +123,23 @@ cargo run -- --env-file /path/to/project.env config
 cargo run -- --no-env-file --timeout-seconds 60 config
 ```
 
-`.env` 支持 dotenvy 的引号、注释和变量展开；含字面 `$` 的值用单引号。重复的 `ISSUEFLOW_` 文件配置项报错。进程变量的空值仍覆盖文件值：空 Token 表示未配置，不回退使用文件里的凭据。
+`.env` supports dotenvy quoting, comments, and variable expansion. Use single quotes for values containing a literal `$`. Duplicate `ISSUEFLOW_` entries in the file are rejected. Empty process environment values still override file values: an empty token is treated as unconfigured and does not fall back to credentials in the file.
 
-| 环境变量 | 默认值 / 用途 |
+| Environment variable | Default / purpose |
 | --- | --- |
-| `ISSUEFLOW_GITHUB_TOKEN` | 可选 GitHub Token，只从环境或文件读取 |
+| `ISSUEFLOW_GITHUB_TOKEN` | Optional GitHub token, read only from the environment or file |
 | `ISSUEFLOW_GITHUB_API_URL` | `https://api.github.com` |
-| `ISSUEFLOW_GITLAB_TOKEN` | 可选 GitLab Token，只从环境或文件读取 |
-| `ISSUEFLOW_GITLAB_URL` | 公司实例地址，例如 `https://gitlab.example.com` |
-| `ISSUEFLOW_PLATFORM` | 可选 `github` 或 `gitlab` |
-| `ISSUEFLOW_REPOSITORY` | 可选完整 `owner/repo` 或 `group/subgroup/project` |
-| `ISSUEFLOW_TIMEOUT_SECONDS` | `30`，允许 1–300 秒 |
+| `ISSUEFLOW_GITLAB_TOKEN` | Optional GitLab token, read only from the environment or file |
+| `ISSUEFLOW_GITLAB_URL` | Instance URL, such as `https://gitlab.example.com` |
+| `ISSUEFLOW_PLATFORM` | Optional `github` or `gitlab` |
+| `ISSUEFLOW_REPOSITORY` | Optional full `owner/repo` or `group/subgroup/project` path |
+| `ISSUEFLOW_TIMEOUT_SECONDS` | `30`; allowed range: 1–300 seconds |
 
-对应非凭据参数：`--platform`、`--repository`、`--github-api-url`、`--gitlab-url`、`--timeout-seconds`。URL 必须为 HTTPS，不接受内嵌凭据、查询参数或片段；支持实例基础路径。所有配置统一校验，但查看配置不要求提供 Token。
+Corresponding non-credential flags are `--platform`, `--repository`, `--github-api-url`, `--gitlab-url`, and `--timeout-seconds`. URLs must use HTTPS and cannot contain embedded credentials, query parameters, or fragments. Instance base paths are supported. All configuration is validated, but inspecting configuration does not require a token.
 
-`config` 输出 JSON，仅报告 Token 是否配置，不输出其内容；错误写入 stderr，配置错误退出码为 2。`.env` 和 `.env.*` 已忽略，仅 `.env.example` 可提交。不要把真实凭据写入示例或命令行参数。
+`config` writes JSON that reports only whether tokens are configured, never their contents. Errors go to stderr; configuration errors use exit code `2`. `.env` and `.env.*` are ignored by Git, with an exception for `.env.example`. Never place real credentials in examples or command-line arguments.
 
-## 开发验证
+## Development validation
 
 ```sh
 cargo fmt --check
@@ -124,4 +147,6 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-测试覆盖配置、凭据隐藏、链接、分页、写入映射、幂等查重、状态和依赖规则，并使用本地 HTTP 服务验证两个 SDK 的认证头、基础路径、JSON、204、重定向和限流行为。测试不写真实项目。真实 GitHub 和极狐 GitLab v18.4.6-jh 尚需单独验收。
+Automated tests cover configuration, credential redaction, URL handling, pagination, write mappings, duplicate detection, state changes, and dependency rules. Local HTTP servers verify both SDKs' authentication headers, base paths, JSON handling, empty `204` responses, redirects, and rate limiting. These tests do not write to real repositories.
+
+Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. See the [GitHub acceptance report](docs/github-acceptance-20260905.md) (in Chinese) for evidence and limitations. Live validation against Jihu GitLab v18.4.6-jh is still pending.
