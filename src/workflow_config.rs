@@ -46,18 +46,31 @@ pub struct Permissions {
     pub draft_pr_mr: Option<bool>,
 }
 impl WorkflowConfig {
+    pub fn platform(&self) -> Result<Platform> {
+        match self.platform.as_str() {
+            "github" => Ok(Platform::Github),
+            "gitlab" => Ok(Platform::Gitlab),
+            _ => Err(Error::new(
+                "configuration",
+                "Workflow platform must be github or gitlab",
+            )),
+        }
+    }
     pub fn validate(&self) -> Result<Value> {
         let invalid = || {
             Error::new(
                 "configuration",
-                "Invalid GitHub workflow configuration; check schema, repository, branch and Project fields",
+                "Invalid workflow configuration; check platform, host, repository, branch and platform fields",
             )
         };
+        let platform = self.platform().map_err(|_| invalid())?;
         if self.schema_version != 1
-            || self.platform != "github"
-            || self.host != "github.com"
+            || self.host.is_empty()
+            || self.host.contains(['/', ':', '@'])
             || self.timezone != "Asia/Shanghai"
-            || !valid_repository(&self.repository, Platform::Github)
+            || !valid_repository(&self.repository, platform)
+            || (platform == Platform::Github && self.host != "github.com")
+            || (platform == Platform::Gitlab && self.github_project_url.is_some())
         {
             return Err(invalid());
         }
@@ -80,13 +93,16 @@ impl WorkflowConfig {
                 return Err(invalid());
             }
         }
+        if platform == Platform::Github && self.github_project_url.is_none() {
+            return Err(invalid());
+        }
         if let Some(url) = &self.github_project_url {
             let cfg = Config::resolve(HashMap::new(), HashMap::new(), Overrides::default())
                 .map_err(Error::from)?;
             ProjectTarget::parse(&cfg, url).map_err(|_| invalid())?;
         }
         Ok(
-            json!({"valid":true,"schema_version":1,"repository":self.repository,"project":self.github_project_url,"delivery_policy":self.delivery_policy,"permissions":self.permissions,"note":"Validation does not execute commands, grant authorization, contact GitHub or load credentials."}),
+            json!({"valid":true,"schema_version":1,"platform":platform,"host":self.host,"repository":self.repository,"project":self.github_project_url,"delivery_policy":self.delivery_policy,"permissions":self.permissions,"note":"Validation does not execute commands, grant authorization, contact a platform or load credentials."}),
         )
     }
 }
