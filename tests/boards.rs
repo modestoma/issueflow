@@ -35,17 +35,17 @@ fn target() -> Target {
 fn labels() -> Value {
     Value::Array(
         [
-            "workflow::待复查",
-            "workflow::待明确",
-            "workflow::就绪",
-            "workflow::开发中",
-            "workflow::待验收",
-            "workflow::已完成",
-            "workflow::已终止",
+            "workflow::Backlog",
+            "workflow::Ready",
+            "workflow::In progress",
+            "workflow::In review",
+            "workflow::Done",
+            "workflow::Cancelled",
+            "needs-clarification",
             "blocked",
-            "resolution::取消",
-            "resolution::重复",
-            "resolution::失效",
+            "resolution::Cancelled",
+            "resolution::Duplicate",
+            "resolution::Invalid",
             "type::bug",
             "type::feature",
             "type::improvement",
@@ -66,8 +66,8 @@ fn labels() -> Value {
 }
 fn lists() -> Value {
     Value::Array([
-        "workflow::待复查", "workflow::待明确", "workflow::就绪", "workflow::开发中",
-        "workflow::待验收", "workflow::已完成", "workflow::已终止",
+        "workflow::Backlog", "workflow::Ready", "workflow::In progress",
+        "workflow::In review", "workflow::Done", "workflow::Cancelled",
     ].iter().enumerate().map(|(index, name)| json!({"id":index + 11,"position":index + 1,"label":{"id":index + 1,"name":name}})).collect())
 }
 
@@ -118,7 +118,7 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
     .await
     .unwrap();
     assert_eq!(result["changed"], false);
-    assert_eq!(result["workflow_lists"].as_array().unwrap().len(), 7);
+    assert_eq!(result["workflow_lists"].as_array().unwrap().len(), 6);
     assert!(
         mock.calls
             .lock()
@@ -132,7 +132,7 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
 async fn creates_board_and_missing_workflow_lists_then_verifies() {
     let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
     let mut replies = vec![labels(), labels(), json!([]), json!({"id":3}), json!([])];
-    replies.extend((0..7).map(|_| json!({"id":99})));
+    replies.extend((0..6).map(|_| json!({"id":99})));
     replies.extend([lists(), board, lists()]);
     let mock = Mock {
         replies: Mutex::new(replies.into()),
@@ -152,7 +152,7 @@ async fn creates_board_and_missing_workflow_lists_then_verifies() {
             .iter()
             .filter(|(method, _, _)| *method == Method::POST)
             .count(),
-        8
+        7
     );
     assert_eq!(calls[3].2.as_ref().unwrap()["name"], "Issueflow Workflow");
     let label_ids: Vec<_> = calls
@@ -160,7 +160,7 @@ async fn creates_board_and_missing_workflow_lists_then_verifies() {
         .filter(|(method, endpoint, _)| *method == Method::POST && endpoint.ends_with("/lists"))
         .map(|(_, _, body)| body.as_ref().unwrap()["label_id"].as_u64().unwrap())
         .collect();
-    assert_eq!(label_ids, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(label_ids, vec![1, 2, 3, 4, 5, 6]);
 }
 
 #[tokio::test]

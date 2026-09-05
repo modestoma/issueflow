@@ -339,8 +339,8 @@ fn errors_do_not_claim_failed_write_was_not_applied() {
 #[tokio::test]
 async fn gitlab_transition_preserves_team_label_and_single_stage() {
     let path = "projects/group%2Fsub%2Frepo/issues/2";
-    let initial = issue(Platform::Gitlab, &["team::a", "workflow::就绪"]);
-    let updated = issue(Platform::Gitlab, &["team::a", "workflow::开发中"]);
+    let initial = issue(Platform::Gitlab, &["team::a", "workflow::Ready"]);
+    let updated = issue(Platform::Gitlab, &["team::a", "workflow::In progress"]);
     let mock = Mock::new(vec![
         step(Method::GET, path, None, initial.clone()),
         step(Method::GET, path, None, initial.clone()),
@@ -348,7 +348,7 @@ async fn gitlab_transition_preserves_team_label_and_single_stage() {
         step(
             Method::PUT,
             path,
-            Some(json!({"add_labels":"workflow::开发中","remove_labels":"workflow::就绪"})),
+            Some(json!({"add_labels":"workflow::In progress","remove_labels":"workflow::Ready"})),
             updated.clone(),
         ),
         step(Method::GET, path, None, updated),
@@ -361,14 +361,17 @@ async fn gitlab_transition_preserves_team_label_and_single_stage() {
     .await
     .unwrap();
     assert_eq!(result["state"], "open");
-    assert_eq!(result["labels"], json!(["team::a", "workflow::开发中"]));
+    assert_eq!(
+        result["labels"],
+        json!(["team::a", "workflow::In progress"])
+    );
 }
 
 #[tokio::test]
 async fn closing_completed_maps_labels_and_platform_state() {
     let path = "projects/group%2Fsub%2Frepo/issues/2";
-    let initial = issue(Platform::Gitlab, &["workflow::待验收", "team::a"]);
-    let labeled = issue(Platform::Gitlab, &["workflow::已完成", "team::a"]);
+    let initial = issue(Platform::Gitlab, &["workflow::In review", "team::a"]);
+    let labeled = issue(Platform::Gitlab, &["workflow::Done", "team::a"]);
     let mut closed = labeled.clone();
     closed["state"] = json!("closed");
     let mock = Mock::new(vec![
@@ -378,7 +381,7 @@ async fn closing_completed_maps_labels_and_platform_state() {
         step(
             Method::PUT,
             path,
-            Some(json!({"add_labels":"workflow::已完成","remove_labels":"workflow::待验收"})),
+            Some(json!({"add_labels":"workflow::Done","remove_labels":"workflow::In review"})),
             labeled.clone(),
         ),
         step(Method::GET, path, None, labeled),
@@ -406,11 +409,11 @@ async fn reopening_clears_resolution_and_returns_to_triage() {
     let path = "projects/group%2Fsub%2Frepo/issues/2";
     let opened = issue(
         Platform::Gitlab,
-        &["workflow::已终止", "resolution::取消", "team::a"],
+        &["workflow::Cancelled", "resolution::Cancelled", "team::a"],
     );
     let mut closed = opened.clone();
     closed["state"] = json!("closed");
-    let triage = issue(Platform::Gitlab, &["workflow::待复查", "team::a"]);
+    let triage = issue(Platform::Gitlab, &["workflow::Backlog", "team::a"]);
     let mock = Mock::new(vec![
         step(Method::GET, path, None, closed),
         step(
@@ -426,7 +429,7 @@ async fn reopening_clears_resolution_and_returns_to_triage() {
             Method::PUT,
             path,
             Some(
-                json!({"add_labels":"workflow::待复查","remove_labels":"workflow::已终止,resolution::取消"}),
+                json!({"add_labels":"workflow::Backlog","remove_labels":"workflow::Cancelled,resolution::Cancelled"}),
             ),
             triage.clone(),
         ),
@@ -439,7 +442,7 @@ async fn reopening_clears_resolution_and_returns_to_triage() {
     .reopen()
     .await
     .unwrap();
-    assert_eq!(result["labels"], json!(["workflow::待复查", "team::a"]));
+    assert_eq!(result["labels"], json!(["workflow::Backlog", "team::a"]));
 }
 
 #[tokio::test]
@@ -494,6 +497,64 @@ async fn gitlab_removes_link_id_not_issue_id() {
         .await
         .unwrap()["removed"],
         true
+    );
+}
+
+#[tokio::test]
+async fn gitlab_metadata_migration_previews_canonical_stage_resolution_and_blocked() {
+    let current = issue(
+        Platform::Gitlab,
+        &[
+            "workflow::待明确",
+            "resolution::取消",
+            "type::feature",
+            "priority::P1",
+        ],
+    );
+    let blocker = json!({
+        "id":44,"iid":4,"link_type":"is_blocked_by","state":"opened",
+        "web_url":"https://gitlab.example/group/sub/repo/-/issues/4",
+        "labels":["workflow::In progress"]
+    });
+    let endpoint = "projects/group%2Fsub%2Frepo/issues/2";
+    let mock = Mock::new(vec![
+        step(Method::GET, endpoint, None, current.clone()),
+        step(Method::GET, endpoint, None, current),
+        step(
+            Method::GET,
+            "projects/group%2Fsub%2Frepo/issues/2/links?per_page=100&page=1",
+            None,
+            json!([blocker]),
+        ),
+    ]);
+    let result = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .reconcile_metadata(false)
+    .await
+    .unwrap();
+    assert_eq!(result["applied"], false);
+    let add = result["add"].as_array().unwrap();
+    for label in [
+        "workflow::Backlog",
+        "needs-clarification",
+        "resolution::Cancelled",
+        "blocked",
+    ] {
+        assert!(add.contains(&json!(label)), "{result}");
+    }
+    assert!(
+        result["remove"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("workflow::待明确"))
+    );
+    assert!(
+        result["remove"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("resolution::取消"))
     );
 }
 

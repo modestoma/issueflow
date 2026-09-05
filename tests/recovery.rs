@@ -163,10 +163,10 @@ fn gitlab_contract() -> BranchContract {
     serde_json::from_value(json!({"schema_version":1,"issue_url":"https://gitlab.example/group/sub/repo/-/issues/1","source_branch":"main","branch":"feat/change","pr_target":"main","pr_url":"https://gitlab.example/group/sub/repo/-/merge_requests/2"})).unwrap()
 }
 fn gitlab_issue() -> Value {
-    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","state":"opened","labels":["type::feature","priority::P1","workflow::待验收"]})
+    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","state":"opened","labels":["type::feature","priority::P1","workflow::In review"]})
 }
 fn gitlab_completed_issue() -> Value {
-    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"closed","labels":["type::feature","priority::P1","workflow::已完成"]})
+    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"closed","labels":["type::feature","priority::P1","workflow::Done"]})
 }
 fn gitlab_mr() -> Value {
     json!({"id":2,"iid":2,"web_url":"https://gitlab.example/group/sub/repo/-/merge_requests/2","state":"merged","merged_at":"now","draft":false,"sha":"a".repeat(40),"source_branch":"feat/change","target_branch":"main","source_project_id":7,"target_project_id":7,"merge_commit_sha":"b".repeat(40),"description":"Refs https://gitlab.example/group/sub/repo/-/issues/1"})
@@ -290,7 +290,7 @@ async fn gitlab_acceptance_policy_never_closes_from_merge_alone() {
 #[tokio::test]
 async fn gitlab_apply_closes_once_after_expected_head_and_reads_back() {
     let completed = gitlab_completed_issue();
-    let completed_open = json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"opened","labels":["type::feature","priority::P1","workflow::已完成"]});
+    let completed_open = json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"opened","labels":["type::feature","priority::P1","workflow::Done"]});
     let mut steps = vec![
         (Method::GET, gitlab_issue()),
         (Method::GET, gitlab_mr()),

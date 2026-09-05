@@ -1,23 +1,13 @@
 use crate::{
     config::Platform,
     error::{Error, Result},
-    service::Service,
+    service::{Service, WORKFLOW_STAGE_LABELS},
     target::{Target, encode},
     transport::Transport,
 };
 use http::Method;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-
-const WORKFLOW_LABELS: [&str; 7] = [
-    "workflow::待复查",
-    "workflow::待明确",
-    "workflow::就绪",
-    "workflow::开发中",
-    "workflow::待验收",
-    "workflow::已完成",
-    "workflow::已终止",
-];
 
 pub struct Boards<'a> {
     pub transport: &'a dyn Transport,
@@ -73,7 +63,7 @@ impl Boards<'_> {
             let label_name = label["name"]
                 .as_str()
                 .ok_or_else(|| Error::new("response", "GitLab label has no name"))?;
-            if WORKFLOW_LABELS.contains(&label_name) {
+            if WORKFLOW_STAGE_LABELS.contains(&label_name) {
                 let id = label["id"]
                     .as_u64()
                     .ok_or_else(|| Error::new("response", "GitLab workflow label has no id"))?;
@@ -82,7 +72,7 @@ impl Boards<'_> {
                 }
             }
         }
-        if label_ids.len() != WORKFLOW_LABELS.len() {
+        if label_ids.len() != WORKFLOW_STAGE_LABELS.len() {
             return Err(Error::new(
                 "response",
                 "Not all GitLab workflow labels are visible",
@@ -129,7 +119,7 @@ impl Boards<'_> {
                 by_name.entry(label.to_string()).or_default().push(list);
             }
         }
-        if WORKFLOW_LABELS
+        if WORKFLOW_STAGE_LABELS
             .iter()
             .any(|name| by_name.get(*name).is_some_and(|lists| lists.len() > 1))
         {
@@ -139,7 +129,7 @@ impl Boards<'_> {
             ));
         }
         let mut changed = created;
-        for label in WORKFLOW_LABELS {
+        for label in WORKFLOW_STAGE_LABELS {
             if !by_name.contains_key(label) {
                 self.transport
                     .request(
@@ -154,7 +144,7 @@ impl Boards<'_> {
         }
         let current = self.service().pages(&lists_root).await?;
         let mut seen = BTreeSet::new();
-        for (index, label) in WORKFLOW_LABELS.iter().enumerate() {
+        for (index, label) in WORKFLOW_STAGE_LABELS.iter().enumerate() {
             let matches: Vec<_> = current
                 .iter()
                 .filter(|list| list["label"]["name"].as_str() == Some(*label))
@@ -184,7 +174,7 @@ impl Boards<'_> {
         }
         let final_board = self.show(board_id).await.map_err(unknown)?;
         let final_lists = self.service().pages(&lists_root).await.map_err(unknown)?;
-        for (index, label) in WORKFLOW_LABELS.iter().enumerate() {
+        for (index, label) in WORKFLOW_STAGE_LABELS.iter().enumerate() {
             if final_lists
                 .iter()
                 .filter(|list| {
@@ -201,7 +191,7 @@ impl Boards<'_> {
             }
         }
         Ok(
-            json!({"changed":changed,"board":final_board,"workflow_lists":final_lists.into_iter().filter(|list| list["label"]["name"].as_str().is_some_and(|name| WORKFLOW_LABELS.contains(&name))).collect::<Vec<_>>() }),
+            json!({"changed":changed,"board":final_board,"workflow_lists":final_lists.into_iter().filter(|list| list["label"]["name"].as_str().is_some_and(|name| WORKFLOW_STAGE_LABELS.contains(&name))).collect::<Vec<_>>() }),
         )
     }
 }
