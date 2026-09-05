@@ -257,6 +257,18 @@ Only explicit `--apply` performs missing actions, guarded by the expected PR hea
 
 Evidence is refreshed before each action and after completion. Repeating a completed recovery is a no-op. The command never merges a PR, creates an issue/PR, modifies local Git state, or posts comments. Partial failures report confirmed completed steps and unknown outcomes; inspect again instead of replaying a merge or a stale plan. These checks and cross-API writes are not atomic: concurrent retargeting, force pushes, acceptance changes or Project automations still require reconciliation. PR/issue references and caller-supplied acceptance are not a distributed lock or cryptographic proof of approval.
 
+## Inspect worktree cleanup eligibility
+
+```sh
+issueflow --no-env-file workflow cleanup-check --file child.json --parent-file parent.json --config-file .issue-workflow.json --worktree /absolute/path/to/worktree
+```
+
+This command never deletes files, worktrees, or branches. It combines recovery evidence with local Git inspection and open PRs targeting the candidate branch. The exact registered worktree root, expected branch and repository remote must match. Main worktrees, locked worktrees, tracked modifications, untracked files, ignored files, incomplete remote delivery, or a local HEAD different from the reviewed PR head prevent eligibility. Ignored files include `.env` and generated `target/` output; the tool does not silently assume they are disposable. Git inspection disables optional index locks and filesystem monitor hooks.
+
+Open PRs cannot reveal unpublished child work. After separately reviewing child issues, branches and worktrees, `--confirm-no-dependent-work` records that dependency check for this invocation; it does not override any detected open dependent PR. Omission keeps the result ineligible. A completed squash/rebase delivery can still be recognized by remote merge ancestry and matching reviewed head without requiring the original head commit to be an ancestor of the target.
+
+`eligible: true` means the recorded checks passed at inspection time, not that deletion was authorized. Recheck immediately before a separately authorized cleanup, and never force-remove a worktree merely because it belongs to a closed issue. Unknown/failed Git or API evidence fails the check. Remote credentials are not printed, and no cleanup is executed by this CLI version.
+
 ## Output and errors
 
 Successful commands write JSON to stdout; errors write JSON to stderr. Normalized issue results contain `platform`, `id`, `number`, `url`, `title`, `body`, `state`, `labels`, `created_at`, and `updated_at`. `id` is the platform-wide ID; `number` is the repository's native issue number (GitLab `iid`). Comments and dependencies retain platform-native JSON.

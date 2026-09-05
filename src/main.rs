@@ -52,6 +52,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WorkflowCommand {
+    /// Read-only worktree cleanup eligibility; never deletes anything
+    CleanupCheck {
+        #[command(flatten)]
+        args: RecoveryArgs,
+        #[arg(long)]
+        worktree: PathBuf,
+        /// Assert no unpublished child issues/branches still depend on this branch
+        #[arg(long)]
+        confirm_no_dependent_work: bool,
+    },
     /// Read remote delivery state and propose missing recovery steps
     Inspect(RecoveryArgs),
     /// Inspect by default; explicitly apply only missing eligible steps
@@ -326,13 +336,23 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         );
     }
     if let Command::Workflow(command) = command {
-        let (args, apply, expected) = match command {
-            WorkflowCommand::Inspect(args) => (args, false, None),
+        let (args, apply, expected, cleanup) = match command {
+            WorkflowCommand::Inspect(args) => (args, false, None, None),
+            WorkflowCommand::CleanupCheck {
+                args,
+                worktree,
+                confirm_no_dependent_work,
+            } => (
+                args,
+                false,
+                None,
+                Some((worktree, confirm_no_dependent_work)),
+            ),
             WorkflowCommand::Reconcile {
                 args,
                 apply,
                 expected_head_sha,
-            } => (args, apply, expected_head_sha),
+            } => (args, apply, expected_head_sha, None),
             _ => unreachable!("offline workflow command handled before configuration"),
         };
         let contract = input::<issueflow::branch_contract::BranchContract>(&args.file)?;
@@ -345,15 +365,19 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         workflow.validate()?;
         contract.validate(parent.as_ref())?;
         let transport = SdkTransport::new(&config, issueflow::config::Platform::Github)?;
-        return issueflow::recovery::Recovery {
+        let recovery = issueflow::recovery::Recovery {
             config: &config,
             transport: &transport,
             contract: &contract,
             parent: parent.as_ref(),
             workflow: &workflow,
+        };
+        if let Some((path, confirmed)) = cleanup {
+            return issueflow::cleanup::inspect(&recovery, &path, confirmed, args.accepted).await;
         }
-        .reconcile(args.accepted, apply, expected.as_deref())
-        .await;
+        return recovery
+            .reconcile(args.accepted, apply, expected.as_deref())
+            .await;
     }
     if let Command::Pr(command) = command {
         use issueflow::pull::{Pulls, target_from_url};
