@@ -163,6 +163,14 @@ Push the head branch first. Head and base must be distinct branches in the same 
 
 `pr list` returns open PRs with complete pagination. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
 
+Inspect the evidence for the current PR head before requesting merge approval:
+
+```sh
+issueflow pr checks https://github.com/owner/repo/pull/8
+```
+
+The command reads paginated check runs, latest commit statuses per context, and review history, then rereads the PR to reject head/base changes during inspection. `observed_checks` is `absent`, `pending`, `failed`, `non_failing` (neutral/skipped), or `passed`. No checks is not a pass. Reviews are annotated with whether their commit matches the current head; they are historical records, not an effective approval count. Required branch/ruleset policies and human acceptance are not evaluated, and `merge_authorized` is always false. API permission failures remain errors, never empty evidence. The SHA is evidence provenance, not a persistent authorization token.
+
 Update a PR selectively or mark a Draft ready for review:
 
 ```sh
@@ -183,7 +191,7 @@ Merge requires an open, non-draft PR with the expected target and full head SHA.
 
 Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. Project-backed closure uses `--no-workflow-labels`; reopening has the same flag. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
-Current commands do not read all review/check-run details, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
 
 ## Output and errors
 

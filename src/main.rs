@@ -79,6 +79,10 @@ fn finish(result: Result<Value>) -> ExitCode {
 
 #[derive(Subcommand)]
 enum PullCommand {
+    /// Inspect checks and review evidence for the current PR head
+    Checks {
+        url: String,
+    },
     Update {
         url: String,
         #[arg(long)]
@@ -260,7 +264,8 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             PullCommand::Show { url }
             | PullCommand::Merge { url, .. }
             | PullCommand::Update { url, .. }
-            | PullCommand::Ready { url, .. } => target_from_url(&config, url)?,
+            | PullCommand::Ready { url, .. }
+            | PullCommand::Checks { url } => target_from_url(&config, url)?,
         };
         if target.platform != issueflow::config::Platform::Github {
             return Err(Error::new("input", "PR commands support GitHub only"));
@@ -283,6 +288,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 service.list(head.as_deref(), base.as_deref()).await
             }
             PullCommand::Show { .. } => service.show().await,
+            PullCommand::Checks { .. } => {
+                issueflow::pull_checks::inspect(&transport, service.target).await
+            }
             PullCommand::Update {
                 file,
                 expected_head_sha,
