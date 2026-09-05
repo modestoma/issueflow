@@ -94,3 +94,31 @@ async fn head_changes_reject_stale_evidence() {
     .unwrap_err();
     assert_eq!(e.code, "conflict");
 }
+
+#[tokio::test]
+async fn unrelated_repository_metadata_does_not_invalidate_evidence() {
+    let before = json!({"number":6,"head":{"sha":"a".repeat(40)},"base":{"ref":"main","sha":"b".repeat(40),"repo":{"id":1,"description":"old"}}});
+    let mut after = before.clone();
+    after["base"]["repo"]["description"] = json!("new");
+    let m = Mock(Mutex::new(
+        vec![
+            before,
+            json!({"check_runs":[]}),
+            json!([]),
+            json!([]),
+            after,
+        ]
+        .into(),
+    ));
+    let v = inspect(
+        &m,
+        Target {
+            platform: Platform::Github,
+            repository: "owner/repo".into(),
+            number: Some(6),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["observed_checks"], "absent");
+}

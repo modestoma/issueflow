@@ -62,7 +62,11 @@ pub async fn inspect(transport: &dyn Transport, target: Target) -> Result<Value>
         ))
         .await?;
     let after = pulls.show().await?;
-    if before["head"]["sha"] != after["head"]["sha"] || before["base"] != after["base"] {
+    if before["head"]["sha"] != after["head"]["sha"]
+        || before["base"]["ref"] != after["base"]["ref"]
+        || before["base"]["sha"] != after["base"]["sha"]
+        || before["base"]["repo"]["id"] != after["base"]["repo"]["id"]
+    {
         return Err(Error::new(
             "conflict",
             "PR head or base changed while reading checks; inspect again",
