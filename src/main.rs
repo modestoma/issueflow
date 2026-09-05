@@ -139,6 +139,11 @@ enum ProjectCommand {
 
 #[derive(Subcommand)]
 enum IssueCommand {
+    /// Read-only recovery lookup; never submits a create request
+    RecoverCreate {
+        #[arg(long)]
+        request_id: String,
+    },
     /// List all visible open and closed issues in the default repository
     List,
     /// Read an issue, optionally including all comments
@@ -210,7 +215,7 @@ enum IssueCommand {
 impl IssueCommand {
     fn url(&self) -> Option<&str> {
         match self {
-            Self::List | Self::Create { .. } => None,
+            Self::List | Self::Create { .. } | Self::RecoverCreate { .. } => None,
             Self::Show { url, .. }
             | Self::Comments { url }
             | Self::Update { url, .. }
@@ -363,6 +368,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         Command::SetupLabels => service.setup_labels().await,
         Command::Issue(command) => match command {
             IssueCommand::List => service.list().await,
+            IssueCommand::RecoverCreate { request_id } => service.recover_create(&request_id).await,
             IssueCommand::Show { comments, .. } => {
                 let issue = service.show().await?;
                 if comments {

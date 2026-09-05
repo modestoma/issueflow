@@ -52,6 +52,14 @@ Creation appends an operation UUID comment to the body. The output includes the 
 
 **This is not a server-side idempotency guarantee.** Concurrent use of the same UUID, incomplete visibility, removed markers, or temporary listing delays can still cause duplicates. A write timeout reports `outcome_unknown: true` and the request ID; inspect the remote state before resending. Requests are never automatically retried and redirects are not followed. An unparseable success response is also treated as an unknown write outcome.
 
+For an uncertain creation outcome, inspect the original request ID without another write:
+
+```sh
+issueflow --platform github --repository owner/repo issue recover-create --request-id UUID
+```
+
+The command scans visible open and closed issues and returns `found`, `not_visible`, or `ambiguous`, with matching issue URLs. UUID matching is normalized, so letter case does not affect lookup. `safe_to_retry` is always false: zero visible matches never proves the earlier create failed, one match should be continued by URL, and multiple matches need reconciliation. This command performs no POST, no local registry maintenance, and no automatic retries. It improves recovery visibility without claiming distributed idempotency or fixing GitHub listing delays.
+
 `--expected-updated-at` checks for stale data before writing. It is not an atomic platform compare-and-swap operation; another update can occur between the check and the write. Merge changes against the latest body.
 
 ### Labels and state
