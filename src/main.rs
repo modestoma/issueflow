@@ -30,7 +30,7 @@ struct Cli {
 enum Command {
     /// Inspect installed command capabilities without loading credentials
     Capabilities,
-    /// Read and maintain native parent/child relationships
+    /// Read and maintain native GitHub Sub-issue relationships
     #[command(subcommand)]
     Hierarchy(HierarchyCommand),
     /// Read and initialize GitLab project issue boards
