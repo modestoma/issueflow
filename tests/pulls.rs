@@ -341,3 +341,49 @@ async fn draft_graphql_errors_are_not_success() {
     assert!(e.outcome_unknown);
     assert!(!e.message.contains("secret"));
 }
+
+#[tokio::test]
+async fn github_default_close_preserves_existing_labels() {
+    let issue = json!({"id":5,"number":5,"html_url":"https://github.com/owner/repo/issues/5","state":"closed","labels":[{"name":"custom-label"},{"name":"workflow::开发中"}]});
+    let m = Mock::new(vec![issue.clone(), json!({}), issue]);
+    let v = Service {
+        transport: &m,
+        target: target(),
+    }
+    .close(CloseReason::Completed)
+    .await
+    .unwrap();
+    assert_eq!(v["labels"], json!(["custom-label", "workflow::开发中"]));
+    let c = m.calls.lock().unwrap();
+    assert_eq!(c.len(), 3);
+    assert!(c.iter().all(|v| !v.1.ends_with("/labels")));
+}
+
+#[tokio::test]
+async fn github_default_reopen_preserves_labels() {
+    let i = json!({"id":5,"number":5,"html_url":"https://github.com/owner/repo/issues/5","state":"open","labels":[{"name":"custom-label"}]});
+    let m = Mock::new(vec![i.clone(), json!({}), i]);
+    let v = Service {
+        transport: &m,
+        target: target(),
+    }
+    .reopen()
+    .await
+    .unwrap();
+    assert_eq!(v["labels"], json!(["custom-label"]));
+    assert_eq!(m.calls.lock().unwrap().len(), 3);
+}
+#[tokio::test]
+async fn github_workflow_label_setup_is_rejected_without_requests() {
+    let m = Mock::new(vec![]);
+    assert!(
+        Service {
+            transport: &m,
+            target: target()
+        }
+        .setup_labels()
+        .await
+        .is_err()
+    );
+    assert!(m.calls.lock().unwrap().is_empty());
+}

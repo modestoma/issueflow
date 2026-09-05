@@ -43,7 +43,7 @@ enum Command {
     Config,
     /// Check API authentication for the configured platform (read-only)
     Doctor,
-    /// Create missing workflow labels in the default repository
+    /// Create missing workflow labels in the default GitLab repository
     SetupLabels,
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
@@ -178,6 +178,22 @@ impl ProjectOwner {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
+    Views {
+        url: String,
+    },
+    InitWorkflow {
+        url: String,
+    },
+    Field {
+        url: String,
+        issue_url: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, conflicts_with = "clear")]
+        to: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// List Projects belonging to an explicit GitHub owner
     List {
         #[arg(long)]
@@ -195,13 +211,22 @@ enum ProjectCommand {
         title: String,
     },
     /// Add missing workflow Status options, preserving existing option IDs
-    InitStatuses { url: String },
+    InitStatuses {
+        url: String,
+    },
     /// Read Project metadata and field options
-    Show { url: String },
+    Show {
+        url: String,
+    },
     /// List all visible Project items and their Status
-    Items { url: String },
+    Items {
+        url: String,
+    },
     /// Add an existing issue, reusing existing membership
-    Add { url: String, issue_url: String },
+    Add {
+        url: String,
+        issue_url: String,
+    },
     /// Read Status, or set an exact option name (does not itself close issues)
     Status {
         url: String,
@@ -257,7 +282,7 @@ enum IssueCommand {
         #[arg(long)]
         remove: Vec<String>,
     },
-    /// Change the workflow stage of an open issue
+    /// Change the label-based workflow stage of an open GitLab issue
     Transition {
         url: String,
         #[arg(long, value_enum)]
@@ -272,7 +297,7 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// Reopen and return to triage, clearing the old resolution
+    /// Reopen an issue; GitLab also restores triage labels
     Reopen {
         url: String,
         #[arg(long)]
@@ -456,11 +481,16 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             ProjectCommand::Show { url }
             | ProjectCommand::Items { url }
             | ProjectCommand::InitStatuses { url }
+            | ProjectCommand::InitWorkflow { url }
+            | ProjectCommand::Views { url }
+            | ProjectCommand::Field { url, .. }
             | ProjectCommand::Add { url, .. }
             | ProjectCommand::Status { url, .. } => ProjectTarget::parse(&config, url)?,
         };
         let issue = match &command {
-            ProjectCommand::Add { issue_url, .. } | ProjectCommand::Status { issue_url, .. } => {
+            ProjectCommand::Add { issue_url, .. }
+            | ProjectCommand::Status { issue_url, .. }
+            | ProjectCommand::Field { issue_url, .. } => {
                 let t = Target::from_url(&config, issue_url)?;
                 if t.platform != issueflow::config::Platform::Github {
                     return Err(Error::new("input", "Projects requires a GitHub issue"));
@@ -479,6 +509,15 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             ProjectCommand::List { .. } => service.owner_projects().await,
             ProjectCommand::Create { title, .. } => service.create(&title).await,
             ProjectCommand::InitStatuses { .. } => service.init_statuses().await,
+            ProjectCommand::InitWorkflow { .. } => service.init_workflow().await,
+            ProjectCommand::Views { .. } => service.view_list().await,
+            ProjectCommand::Field {
+                name, to, clear, ..
+            } => {
+                service
+                    .field(issue.as_ref().unwrap(), &name, to.as_deref(), clear)
+                    .await
+            }
             ProjectCommand::Items { .. } => service.items().await,
             ProjectCommand::Add { .. } => service.add(issue.as_ref().unwrap()).await,
             ProjectCommand::Status { to, .. } => {

@@ -2,7 +2,7 @@
 
 A Rust CLI for managing GitHub and GitLab issues. It accesses platform APIs directly through SDKs, without requiring `gh`, `glab`, or Python.
 
-Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; and managing native blocking dependencies. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. Development of this CLI does not use the issue-workflow workflow.
+Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; and managing native blocking dependencies. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
 
 ## Build and usage
 
@@ -34,13 +34,12 @@ Example `issue.json`:
 ```json
 {
   "title": "[20260905] Improve error messages",
-  "body": "## Background\n…\n\n## Acceptance criteria\n- [ ] …",
-  "labels": ["type::improvement", "workflow::待复查", "priority::P2"]
+  "body": "## Background\n…\n\n## Acceptance criteria\n- [ ] …"
 }
 ```
 
 ```sh
-issueflow --platform github --repository owner/repo setup-labels
+issueflow project init-workflow https://github.com/users/owner/projects/1
 issueflow --platform github --repository owner/repo issue create --file issue.json
 issueflow issue update https://github.com/owner/repo/issues/42 --file changes.json --expected-updated-at '2026-09-05T08:00:00Z'
 issueflow issue comment https://github.com/owner/repo/issues/42 --file progress.md
@@ -62,32 +61,21 @@ The command scans visible open and closed issues and returns `found`, `not_visib
 
 `--expected-updated-at` checks for stale data before writing. It is not an atomic platform compare-and-swap operation; another update can occur between the check and the write. Merge changes against the latest body.
 
-### Labels and state
+### Issue state and GitLab labels
+
+GitHub close/reopen now change **native state only** and preserve all existing labels. Workflow metadata belongs in the required Project; set Resolution and Status explicitly through Project commands. GitHub `issue transition` and `setup-labels` reject workflow label operations and direct callers to Project commands. The generic `issue labels` API remains available for explicitly requested legacy label maintenance, not routine GitHub workflow execution. Existing repository labels are not bulk-deleted or automatically migrated.
+
+GitLab retains the label workflow:
 
 ```sh
-issueflow issue labels https://github.com/owner/repo/issues/42
-issueflow issue labels https://github.com/owner/repo/issues/42 --add blocked --remove old-label
-issueflow issue transition https://github.com/owner/repo/issues/42 --to in-progress
-issueflow issue transition https://github.com/owner/repo/issues/42 --to awaiting-review
-issueflow issue close https://github.com/owner/repo/issues/42 --reason completed
-issueflow issue reopen https://github.com/owner/repo/issues/42
+issueflow --platform gitlab --repository group/repo setup-labels
+issueflow issue transition https://gitlab.example.com/group/repo/-/issues/42 --to in-progress
+issueflow issue labels https://gitlab.example.com/group/repo/-/issues/42 --add blocked
+issueflow issue close https://gitlab.example.com/group/repo/-/issues/42 --reason completed
+issueflow issue reopen https://gitlab.example.com/group/repo/-/issues/42
 ```
 
-The supported stages are `triage`, `clarification`, `ready`, `in-progress`, and `awaiting-review`. They map to Chinese workflow labels used by the current implementation:
-
-| Stage | Label |
-| --- | --- |
-| `triage` | `workflow::待复查` |
-| `clarification` | `workflow::待明确` |
-| `ready` | `workflow::就绪` |
-| `in-progress` | `workflow::开发中` |
-| `awaiting-review` | `workflow::待验收` |
-
-A transition removes the previous workflow label, preserves other labels, and reads back the result for verification. A closed issue must be explicitly reopened before transitioning to an open stage.
-
-Supported close reasons are `completed`, `cancelled`, `duplicate`, and `invalid`. Completion sets `workflow::已完成`; other reasons set `workflow::已终止` with a corresponding resolution label (`resolution::取消`, `resolution::重复`, or `resolution::失效`). On GitHub, all non-completion reasons use the native `not_planned` state reason. For duplicates, include the original issue URL in the body or a comment. Reopening clears old resolution labels and returns the issue to triage.
-
-The CLI executes explicit commands. It does not determine whether a human has accepted the work, and it does not automatically merge or release anything. Use `close --reason completed` after human acceptance and delivery requirements are met. Label changes and closing involve multiple requests without a shared transaction. Partial success is reported as an error; reconcile against the remote state. `setup-labels` creates missing labels while preserving existing colors and unrelated labels. The general `labels` command can manage labels directly; use `transition`, `close`, and `reopen` to keep workflow stages and native issue state consistent.
+GitLab transitions support triage, clarification, ready, in-progress and awaiting-review. Close reasons are completed/cancelled/duplicate/invalid, with workflow/resolution label maintenance; reopening returns to triage and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
 
 ### Dependencies
 
@@ -125,15 +113,15 @@ For a board using these stages, the recommended workflow mapping is:
 
 | Workflow meaning | Project Status |
 | --- | --- |
-| Captured, being reviewed, or awaiting clarification | Backlog |
-| Clarified and ready to start, with prerequisites available | Ready |
-| Implementation and verification in progress | In progress |
-| Awaiting review or human acceptance | In review |
-| Accepted and delivered | Done |
+| Captured, not yet taken up | Backlog |
+| Taken up and preparing to process | Ready |
+| Active investigation, clarification, implementation or verification | In progress |
+| PR created or verified updates pushed for review | In review |
+| PR merged into the contracted target; native closure is assessed separately | Done |
 
-Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. Status option initialization is available explicitly through `project init-statuses`; routine status changes do not create fields or options. Keep type, priority, and blocked labels independently.
+Use Cancelled for termination and Resolution to distinguish Cancelled, Duplicate and Invalid; do not interpret every closed issue as Done. Routine status changes never create fields or options.
 
-Projects-backed GitHub workflows should use `project status` as the stage store instead of calling the label-based `issue transition`. `issue transition` remains label-based. For Project-backed workflows, close/reopen with `--no-workflow-labels` to change only native issue state and preserve all labels; update Project Status separately. This option also leaves resolution labels unchanged, so reconcile termination reasons explicitly when needed. Without the flag, existing close/reopen label behavior remains unchanged.
+GitHub workflows require a configured Project before work begins. If none exists, create/reuse one, run `project init-workflow`, verify the Board and fields, and save the confirmed URL. Do not fall back to labels when configuration or permissions are missing. Native issue Open/Closed and blocking dependencies remain separate from Project metadata.
 
 **Project Status and issue state are separate.** The CLI does not send issue-close mutations when changing Status. However, GitHub Project automations can close issues or overwrite Status when items change. Inspect the Project's Workflows settings before using live status writes; disable automatic closure if it would bypass human acceptance. Moving a card does not launch Codex or authorize merging or deployment.
 
@@ -142,12 +130,35 @@ Projects-backed GitHub workflows should use `project status` as the stage store 
 ```sh
 issueflow project list --owner modestoma
 issueflow project create --owner modestoma --title 'My workflow'
-issueflow project init-statuses https://github.com/users/modestoma/projects/2
+issueflow project init-workflow https://github.com/users/modestoma/projects/2
 ```
 
 Use `--owner-type organization` for an organization. `list` reads all visible Projects for the explicit owner. `create` reuses a unique open Project with the exact title, rejects ambiguous/closed matches, or creates a new Project and verifies it by its returned ID/number. No mutation is automatically retried. Title lookup is best-effort reuse, not an atomic idempotency guarantee; after an unknown outcome inspect the owner's Project list before any new create attempt.
 
-`init-statuses` adds missing `Backlog`, `Ready`, `In progress`, `In review`, `Done`, and `Cancelled` options to the existing Status field. It preserves existing option IDs, names, colors and descriptions (including unused default options), rejects ambiguous or closed Projects, checks for intervening field changes, and reads back the result. Existing card values should remain attached to the same option IDs. The API updates the complete option list, so concurrent edits between the final check and write can still race; this is not a transaction. Existing workflows and view layouts are not modified; choose a Board view in GitHub when needed. Review automation settings separately before using the board.
+`init-workflow` initializes the following single-select fields while preserving existing option IDs, names, colors and descriptions:
+
+| Field | Options |
+| --- | --- |
+| Status | Backlog, Ready, In progress, In review, Done, Cancelled |
+| Work type | bug, feature, improvement, refactor, docs, chore, research |
+| Priority | P0, P1, P2, P3 |
+| Blocked | No, Yes |
+| Resolution | Completed, Cancelled, Duplicate, Invalid; leave unset until resolved |
+
+GitHub reserves the field name `Type`, so the custom field is named **Work type**. Existing defaults/options are retained. A Board view with Status as its vertical column grouping is reused, or an `Issueflow Kanban` view is created and read back. Unrelated views are not overwritten. An existing dedicated view with incompatible grouping/filter produces an error. Project automations remain unchanged.
+
+The API updates complete option lists; the final read-before-write check is not an atomic lock against concurrent edits. Initialization can partially succeed, so inspect fields/views before retrying. `project views URL` provides read-only view evidence; `init-statuses` remains available for Status-only initialization.
+
+```sh
+issueflow project field PROJECT_URL ISSUE_URL --name 'Work type' --to feature
+issueflow project field PROJECT_URL ISSUE_URL --name Priority --to P2
+issueflow project field PROJECT_URL ISSUE_URL --name Blocked --to Yes
+issueflow project field PROJECT_URL ISSUE_URL --name Resolution --to Completed
+issueflow project field PROJECT_URL ISSUE_URL --name Resolution --clear
+```
+
+Omitting `--to` and `--clear` reads the field. Names/options match exactly; missing/ambiguous fields fail before writing. Add the issue first. Clear Resolution on reopening, reconsider Blocked and set the actual workflow stage. The CLI does not read legacy labels to infer these values or bulk-remove them. Migrate existing issue metadata deliberately before switching its source of truth.
+
 
 After successful readback, record the selected URL as `github_project_url` in the repository's secret-free `.issue-workflow.json` and run `workflow validate`. Do not save guessed URLs or create a new Project merely because an existing one is inaccessible. The CLI does not automatically overwrite local configuration or provision every repository; these commands are explicit onboarding actions.
 
@@ -211,7 +222,7 @@ issueflow issue close https://github.com/owner/repo/issues/5 --reason completed 
 
 Merge requires an open, non-draft PR with the expected target and full head SHA. The SHA is also passed to GitHub's merge endpoint; draft, stale expectations, unconfirmed merge responses, and failed readback are errors. Methods are `merge` (default), `squash`, and `rebase`. GitHub permissions and branch protections still apply. Target-branch validation is a read-before-write check, not an atomic lock against concurrent retargeting. This implementation handles ordinary PRs, not GitHub native stacked-PR batch merges or merge queues.
 
-Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. Project-backed closure uses `--no-workflow-labels`; reopening has the same flag. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
+Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. GitHub closure and reopening are native-only by default; maintain Project fields separately. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
 Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
 
@@ -253,7 +264,7 @@ A merged PR is considered delivered only when its merge commit is reachable from
 
 Under `delivery_policy: "merged"`, verified target delivery allows closure planning. Under `acceptance_required`, the caller must explicitly pass `--accepted` only after human acceptance has been confirmed; a green check or merged PR is insufficient. Reuse an existing confirmed acceptance decision when resuming, rather than asking the user repeatedly. Configuration and these flags do not grant merge permission.
 
-Only explicit `--apply` performs missing actions, guarded by the expected PR head: add missing Project membership, set Project Status to Done, and/or close the native issue while preserving labels. The workflow configuration supplies the Project URL. Project-backed recovery removes redundant workflow-stage labels; without a Project it reconciles the workflow stage label to `workflow::已完成`. Type, priority and other unrelated labels are preserved. Missing/ambiguous Done options, archived items, terminated issues, unknown closure reasons, or unmerged PRs block writes. Terminated issues are never reopened or relabeled as completed.
+Only explicit `--apply` performs missing actions, guarded by the expected PR head: add missing Project membership, set Project Status to Done, and/or close the native issue while preserving labels. The workflow configuration must supply a Project URL and initialized metadata fields; missing configuration yields setup_required, never label fallback. Recovery reads Blocked and Resolution from Project fields, sets Resolution=Completed when completing delivery, and never changes labels. Missing/ambiguous Done options, archived items, terminated issues, unknown closure reasons, or unmerged PRs block writes. Terminated issues are never reopened or relabeled as completed.
 
 Evidence is refreshed before each action and after completion. Repeating a completed recovery is a no-op. The command never merges a PR, creates an issue/PR, modifies local Git state, or posts comments. Partial failures report confirmed completed steps and unknown outcomes; inspect again instead of replaying a merge or a stale plan. These checks and cross-API writes are not atomic: concurrent retargeting, force pushes, acceptance changes or Project automations still require reconciliation. PR/issue references and caller-supplied acceptance are not a distributed lock or cryptographic proof of approval.
 
