@@ -68,7 +68,14 @@ fn lists() -> Value {
     Value::Array([
         "workflow::Backlog", "workflow::Ready", "workflow::In progress",
         "workflow::In review", "workflow::Done", "workflow::Cancelled",
-    ].iter().enumerate().map(|(index, name)| json!({"id":index + 11,"position":index + 1,"label":{"id":index + 1,"name":name}})).collect())
+    ].iter().enumerate().map(|(index, name)| json!({"id":index + 11,"position":index,"label":{"id":index + 1,"name":name}})).collect())
+}
+
+fn lists_with_positions(positions: [usize; 6]) -> Value {
+    Value::Array([
+        "workflow::Backlog", "workflow::Ready", "workflow::In progress",
+        "workflow::In review", "workflow::Done", "workflow::Cancelled",
+    ].iter().enumerate().map(|(index, name)| json!({"id":index + 11,"position":positions[index],"label":{"id":index + 1,"name":name}})).collect())
 }
 
 #[tokio::test]
@@ -126,6 +133,49 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
             .iter()
             .all(|(method, _, _)| *method == Method::GET)
     );
+}
+
+#[tokio::test]
+async fn misordered_workflow_lists_move_only_mismatches_to_zero_based_positions() {
+    let current = lists_with_positions([1, 0, 2, 3, 4, 5]);
+    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                labels(),
+                labels(),
+                json!([board.clone()]),
+                current.clone(),
+                current,
+                json!({"id":11}),
+                json!({"id":12}),
+                board,
+                lists(),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow("Issueflow Workflow")
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    let calls = mock.calls.lock().unwrap();
+    let moves: Vec<_> = calls
+        .iter()
+        .filter(|(method, _, _)| *method == Method::PUT)
+        .map(|(_, endpoint, body)| {
+            (
+                endpoint.rsplit('/').next().unwrap(),
+                body.as_ref().unwrap()["position"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(moves, vec![("11", 0), ("12", 1)]);
 }
 
 #[tokio::test]
