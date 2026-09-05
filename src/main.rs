@@ -30,6 +30,9 @@ struct Cli {
 enum Command {
     /// Inspect installed command capabilities without loading credentials
     Capabilities,
+    /// Read and initialize GitLab project issue boards
+    #[command(subcommand)]
+    Board(BoardCommand),
     /// Validate a secret-free GitHub workflow configuration (offline)
     #[command(subcommand)]
     Workflow(WorkflowCommand),
@@ -48,6 +51,18 @@ enum Command {
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+}
+
+#[derive(Subcommand)]
+enum BoardCommand {
+    List,
+    Show {
+        id: u64,
+    },
+    InitWorkflow {
+        #[arg(long, default_value = "Issueflow Workflow")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -368,6 +383,19 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         return Ok(
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
+    }
+    if let Command::Board(command) = command {
+        let target = Target::defaults(&config)?;
+        let transport = SdkTransport::new(&config, target.platform)?;
+        let boards = issueflow::board::Boards {
+            transport: &transport,
+            target,
+        };
+        return match command {
+            BoardCommand::List => boards.list().await,
+            BoardCommand::Show { id } => boards.show(id).await,
+            BoardCommand::InitWorkflow { name } => boards.init_workflow(&name).await,
+        };
     }
     if let Command::Workflow(command) = command {
         let (args, apply, expected, cleanup) = match command {
