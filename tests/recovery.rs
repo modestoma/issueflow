@@ -165,6 +165,9 @@ fn gitlab_contract() -> BranchContract {
 fn gitlab_issue() -> Value {
     json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","state":"opened","labels":["type::feature","priority::P1","workflow::待验收"]})
 }
+fn gitlab_completed_issue() -> Value {
+    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"closed","labels":["type::feature","priority::P1","workflow::已完成"]})
+}
 fn gitlab_mr() -> Value {
     json!({"id":2,"iid":2,"web_url":"https://gitlab.example/group/sub/repo/-/merge_requests/2","state":"merged","merged_at":"now","draft":false,"sha":"a".repeat(40),"source_branch":"feat/change","target_branch":"main","source_project_id":7,"target_project_id":7,"merge_commit_sha":"b".repeat(40),"description":"Refs https://gitlab.example/group/sub/repo/-/issues/1"})
 }
@@ -265,6 +268,55 @@ async fn gitlab_acceptance_policy_never_closes_from_merge_alone() {
     .unwrap();
     assert_eq!(v["plan"]["phase"], "acceptance_pending");
     assert_eq!(v["plan"]["actions"], json!([]));
+}
+
+#[tokio::test]
+async fn gitlab_apply_closes_once_after_expected_head_and_reads_back() {
+    let completed = gitlab_completed_issue();
+    let completed_open = json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"opened","labels":["type::feature","priority::P1","workflow::已完成"]});
+    let mut steps = vec![(Method::GET, gitlab_issue()), (Method::GET, gitlab_mr())];
+    steps.extend([(Method::GET, gitlab_issue()), (Method::GET, gitlab_mr())]);
+    steps.extend([
+        (Method::GET, gitlab_issue()),
+        (Method::GET, gitlab_issue()),
+        (Method::GET, gitlab_issue()),
+        (Method::PUT, json!({})),
+        (Method::GET, completed_open),
+        (Method::PUT, completed.clone()),
+    ]);
+    steps.extend([(Method::GET, completed), (Method::GET, gitlab_mr())]);
+    let m = Mock {
+        steps: Mutex::new(steps.into()),
+        calls: Mutex::new(vec![]),
+    };
+    let cfg = gitlab_cfg();
+    let c = gitlab_contract();
+    let w = gitlab_workflow("merged");
+    let v = Recovery {
+        config: &cfg,
+        transport: &m,
+        contract: &c,
+        parent: None,
+        workflow: &w,
+    }
+    .reconcile(false, true, Some(&"a".repeat(40)))
+    .await
+    .unwrap();
+    assert_eq!(v["plan"]["phase"], "complete");
+    let writes: Vec<_> = m
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| *method == Method::PUT)
+        .cloned()
+        .collect();
+    assert_eq!(writes.len(), 2);
+    assert!(
+        writes
+            .iter()
+            .all(|(_, path)| path == "projects/group%2Fsub%2Frepo/issues/1")
+    );
 }
 #[tokio::test]
 async fn apply_only_closes_issue_without_merging_or_commenting() {
