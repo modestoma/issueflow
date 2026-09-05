@@ -214,7 +214,7 @@ impl Recovery<'_> {
             s.project_configured = true;
             s.in_project = true;
             s.project_status = Some((*stages[0]).to_string());
-            if names.contains(&"workflow::已完成") {
+            if names.contains(&"workflow::Done") {
                 s.resolution = Some("Completed".into());
                 s.issue_reason = Some("completed".into());
             }

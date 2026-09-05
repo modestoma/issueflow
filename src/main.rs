@@ -267,6 +267,12 @@ enum IssueCommand {
         #[arg(long)]
         request_id: String,
     },
+    /// Preview or apply canonical GitLab workflow metadata migration
+    ReconcileMetadata {
+        url: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// List all visible open and closed issues in the default repository
     List,
     /// Read an issue, optionally including all comments
@@ -321,7 +327,7 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// Reopen an issue; GitLab also restores triage labels
+    /// Reopen an issue; GitLab also restores the Backlog stage
     Reopen {
         url: String,
         #[arg(long)]
@@ -340,6 +346,7 @@ impl IssueCommand {
         match self {
             Self::List | Self::Create { .. } | Self::RecoverCreate { .. } => None,
             Self::Show { url, .. }
+            | Self::ReconcileMetadata { url, .. }
             | Self::Comments { url }
             | Self::Update { url, .. }
             | Self::Comment { url, .. }
@@ -614,6 +621,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         Command::Issue(command) => match command {
             IssueCommand::List => service.list().await,
             IssueCommand::RecoverCreate { request_id } => service.recover_create(&request_id).await,
+            IssueCommand::ReconcileMetadata { apply, .. } => {
+                service.reconcile_metadata(apply).await
+            }
             IssueCommand::Show { comments, .. } => {
                 let issue = service.show().await?;
                 if comments {
