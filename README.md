@@ -231,6 +231,19 @@ Workflow validation checks a GitHub-only, secret-free schema with `schema_versio
 
 `delivery_policy` is `merged` when approved merge into the contracted target completes delivery, or `acceptance_required` when deployment/device/business acceptance remains necessary. Omission defaults to `acceptance_required`. Both policies still require user merge approval. `permissions` retains independent local_commit/push flags and optional pull_request/draft_pr_mr flags; a legacy Draft permission is not promoted to general PR permission.
 
+### Delivery and closure policy
+
+| Policy | Meaning of an approved merge | When the issue may close |
+| --- | --- | --- |
+| `merged` | Delivery into this issue's contracted PR target completes the code task | After merged state and target delivery are verified, unless additional acceptance was explicitly required |
+| `acceptance_required` | Code has landed but delivery may remain incomplete | Only after the additional deployment, device, or business acceptance has been confirmed |
+
+A policy never grants merge permission. User approval applies to the specific reviewed PR/head; approving a child PR does not approve its parent. A child delivers to its parent integration branch, while the parent requires overall acceptance and delivery to the original target. Without an explicit policy, keep the conservative `acceptance_required` default; do not infer acceptance from a closed PR or green CI.
+
+For each authorized merge, finish one issue before moving to the next: verify merged state and target, evaluate its delivery condition, update Project/issue state if eligible, then read both back. If delivery remains pending, keep the issue open and state the concrete remaining check. If an API step fails, inspect actual state and retry only the missing authorized step; do not repeat the merge or claim the whole batch is complete.
+
+Project stage timing is part of the workflow: record Ready once prerequisites are satisfied, set and verify In progress **before implementation**, and enter In review only after a PR and verification are ready. Historical missing transitions are acknowledged, not backfilled by rewinding the current stage.
+
 Project URLs are validated against the supported canonical github.com user/org format without contacting the server. Credential configuration remains separate; no `.env` is needed when the process already has `ISSUEFLOW_GITHUB_TOKEN`.
 
 ## Configuration
