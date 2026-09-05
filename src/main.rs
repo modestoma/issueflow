@@ -398,7 +398,38 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         let workflow = input::<issueflow::workflow_config::WorkflowConfig>(&args.config_file)?;
         workflow.validate()?;
         contract.validate(parent.as_ref())?;
-        let transport = SdkTransport::new(&config, issueflow::config::Platform::Github)?;
+        let platform = workflow.platform()?;
+        match platform {
+            issueflow::config::Platform::Github
+                if workflow.host != "github.com"
+                    || config.github_api_url.as_str() != "https://api.github.com/" =>
+            {
+                return Err(Error::new(
+                    "configuration",
+                    "Workflow host does not match the configured GitHub API",
+                ));
+            }
+            issueflow::config::Platform::Gitlab => {
+                let host = config
+                    .gitlab_url
+                    .as_ref()
+                    .and_then(url::Url::host_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "configuration",
+                            "GitLab workflow requires --gitlab-url or ISSUEFLOW_GITLAB_URL",
+                        )
+                    })?;
+                if !host.eq_ignore_ascii_case(&workflow.host) {
+                    return Err(Error::new(
+                        "configuration",
+                        "Workflow host does not match the configured GitLab API",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let transport = SdkTransport::new(&config, platform)?;
         let recovery = issueflow::recovery::Recovery {
             config: &config,
             transport: &transport,

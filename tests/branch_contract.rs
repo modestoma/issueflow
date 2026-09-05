@@ -62,3 +62,17 @@ fn root_validates_and_invalid_branch_fails() {
             .is_err()
     );
 }
+
+#[test]
+fn gitlab_contract_preserves_non_default_port() {
+    let contract: BranchContract = serde_json::from_value(json!({
+        "schema_version":1,
+        "issue_url":"https://gitlab.example:8443/group/repo/-/issues/1",
+        "source_branch":"main",
+        "branch":"feat/change",
+        "pr_target":"main",
+        "pr_url":"https://gitlab.example:8443/group/repo/-/merge_requests/2"
+    }))
+    .unwrap();
+    assert!(contract.validate(None).is_ok());
+}
