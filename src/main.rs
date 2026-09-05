@@ -120,8 +120,40 @@ enum PullCommand {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProjectOwner {
+    User,
+    Organization,
+}
+impl ProjectOwner {
+    fn path(self) -> &'static str {
+        match self {
+            Self::User => "users",
+            Self::Organization => "orgs",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ProjectCommand {
+    /// List Projects belonging to an explicit GitHub owner
+    List {
+        #[arg(long)]
+        owner: String,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+    },
+    /// Create a Project or reuse a unique matching title; never retries mutations
+    Create {
+        #[arg(long)]
+        owner: String,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+        #[arg(long)]
+        title: String,
+    },
+    /// Add missing workflow Status options, preserving existing option IDs
+    InitStatuses { url: String },
     /// Read Project metadata and field options
     Show { url: String },
     /// List all visible Project items and their Status
@@ -321,13 +353,24 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
     }
     if let Command::Project(command) = command {
         use issueflow::project::{ProjectTarget, Projects};
-        let url = match &command {
+        let target = match &command {
+            ProjectCommand::List { owner, owner_type }
+            | ProjectCommand::Create {
+                owner, owner_type, ..
+            } => ProjectTarget::parse(
+                &config,
+                &format!(
+                    "https://github.com/{}/{}/projects/1",
+                    owner_type.path(),
+                    owner
+                ),
+            )?,
             ProjectCommand::Show { url }
             | ProjectCommand::Items { url }
+            | ProjectCommand::InitStatuses { url }
             | ProjectCommand::Add { url, .. }
-            | ProjectCommand::Status { url, .. } => url,
+            | ProjectCommand::Status { url, .. } => ProjectTarget::parse(&config, url)?,
         };
-        let target = ProjectTarget::parse(&config, url)?;
         let issue = match &command {
             ProjectCommand::Add { issue_url, .. } | ProjectCommand::Status { issue_url, .. } => {
                 let t = Target::from_url(&config, issue_url)?;
@@ -345,6 +388,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         };
         return match command {
             ProjectCommand::Show { .. } => service.show().await,
+            ProjectCommand::List { .. } => service.owner_projects().await,
+            ProjectCommand::Create { title, .. } => service.create(&title).await,
+            ProjectCommand::InitStatuses { .. } => service.init_statuses().await,
             ProjectCommand::Items { .. } => service.items().await,
             ProjectCommand::Add { .. } => service.add(issue.as_ref().unwrap()).await,
             ProjectCommand::Status { to, .. } => {
