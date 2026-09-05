@@ -193,6 +193,21 @@ Exit codes:
 
 Raw server error bodies are not printed, to avoid accidentally exposing credentials. The HTTP status is retained in `status`. Clap command usage errors use the standard CLI help format. A GitHub `403` can also indicate secondary rate limiting and requires interpretation in context.
 
+## Workflow configuration and capability discovery
+
+```sh
+issueflow capabilities
+issueflow workflow validate --file .issue-workflow.json
+```
+
+These commands run offline before `.env` or environment configuration is loaded. `capabilities` derives its command/option tree from the installed CLI parser, so different builds can be distinguished even when their package versions match. It does not imply remote permissions.
+
+Workflow validation checks a GitHub-only, secret-free schema with `schema_version: 1`, `platform: "github"`, `host: "github.com"`, full `repository`, `remote`, `base_branch`, `timezone: "Asia/Shanghai"`, and explicit `permissions`. Optional fields include `proposer`, `verification_commands`, `manual_acceptance`, `delivery_condition`, `github_project_url`, and `branch_prefixes`. Unknown fields (including token fields) are rejected; configured commands are never executed. Validation neither changes API routing nor grants authorization. Existing API commands still use their normal explicit flags/environment configuration.
+
+`delivery_policy` is `merged` when approved merge into the contracted target completes delivery, or `acceptance_required` when deployment/device/business acceptance remains necessary. Omission defaults to `acceptance_required`. Both policies still require user merge approval. `permissions` retains independent local_commit/push flags and optional pull_request/draft_pr_mr flags; a legacy Draft permission is not promoted to general PR permission.
+
+Project URLs are validated against the supported canonical github.com user/org format without contacting the server. Credential configuration remains separate; no `.env` is needed when the process already has `ISSUEFLOW_GITHUB_TOKEN`.
+
 ## Configuration
 
 Precedence, from highest to lowest: **explicit CLI flags > process environment variables > `.env` > built-in defaults**.

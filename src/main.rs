@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, process::ExitCode};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use issueflow::config::{Config, Overrides, read_env_file};
 use issueflow::{
     error::{Error, Result},
@@ -28,6 +28,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect installed command capabilities without loading credentials
+    Capabilities,
+    /// Validate a secret-free GitHub workflow configuration (offline)
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
     /// Create, inspect and explicitly merge GitHub pull requests
     #[command(subcommand)]
     Pr(PullCommand),
@@ -43,6 +48,33 @@ enum Command {
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommand {
+    Validate {
+        #[arg(long, default_value = ".issue-workflow.json")]
+        file: PathBuf,
+    },
+}
+
+fn command_schema(c: &clap::Command) -> Value {
+    json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
+}
+fn finish(result: Result<Value>) -> ExitCode {
+    match result {
+        Ok(v) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v).expect("JSON serialization")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{}", json!({"error":e}));
+            ExitCode::from(e.exit_code())
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -362,6 +394,21 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    match &cli.command {
+        Command::Capabilities => {
+            return finish(Ok(
+                json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
+            ));
+        }
+        Command::Workflow(WorkflowCommand::Validate { file }) => {
+            return finish(
+                input::<issueflow::workflow_config::WorkflowConfig>(file)
+                    .and_then(|v| v.validate()),
+            );
+        }
+        _ => {}
+    }
+
     let result = (|| {
         let file = if cli.no_env_file {
             HashMap::new()
