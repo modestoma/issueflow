@@ -247,3 +247,97 @@ async fn native_close_and_reopen_preserve_labels() {
         assert!(c[1].2.as_ref().unwrap().get("labels").is_none());
     }
 }
+
+#[tokio::test]
+async fn update_preserves_reference_and_unspecified_title() {
+    use issueflow::pull::UpdatePull;
+    let mut edited = pr();
+    edited["body"] = json!("New plan\n\nRefs https://github.com/owner/repo/issues/5");
+    let m = Mock::new(vec![pr(), json!({}), edited]);
+    Pulls {
+        transport: &m,
+        target: target(),
+    }
+    .update(
+        UpdatePull {
+            title: None,
+            body: Some("New plan".into()),
+        },
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .await
+    .unwrap();
+    let calls = m.calls.lock().unwrap();
+    let payload = calls[1].2.as_ref().unwrap();
+    assert!(payload.get("title").is_none());
+    assert!(payload["body"].as_str().unwrap().contains("Refs https://"));
+}
+#[tokio::test]
+async fn ready_checks_sha_before_mutation() {
+    let m = Mock::new(vec![pr()]);
+    assert!(
+        Pulls {
+            transport: &m,
+            target: target()
+        }
+        .ready("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .await
+        .is_err()
+    );
+    assert_eq!(m.calls.lock().unwrap().len(), 1);
+}
+#[tokio::test]
+async fn ready_is_idempotent() {
+    let m = Mock::new(vec![pr()]);
+    assert_eq!(
+        Pulls {
+            transport: &m,
+            target: target()
+        }
+        .ready("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .unwrap()["changed"],
+        false
+    );
+}
+#[tokio::test]
+async fn draft_ready_mutation_uses_node_id() {
+    let mut draft = pr();
+    draft["draft"] = json!(true);
+    draft["node_id"] = json!("PR1");
+    let m = Mock::new(vec![
+        draft,
+        json!({"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR1"}}}}),
+        pr(),
+    ]);
+    assert_eq!(
+        Pulls {
+            transport: &m,
+            target: target()
+        }
+        .ready("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .unwrap()["changed"],
+        true
+    );
+    assert_eq!(
+        m.calls.lock().unwrap()[1].2.as_ref().unwrap()["variables"]["id"],
+        "PR1"
+    );
+}
+#[tokio::test]
+async fn draft_graphql_errors_are_not_success() {
+    let mut draft = pr();
+    draft["draft"] = json!(true);
+    draft["node_id"] = json!("PR1");
+    let m = Mock::new(vec![draft, json!({"errors":[{"message":"secret"}]})]);
+    let e = Pulls {
+        transport: &m,
+        target: target(),
+    }
+    .ready("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .await
+    .unwrap_err();
+    assert!(e.outcome_unknown);
+    assert!(!e.message.contains("secret"));
+}
