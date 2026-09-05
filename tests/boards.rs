@@ -129,6 +129,65 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
 }
 
 #[tokio::test]
+async fn creates_board_and_missing_workflow_lists_then_verifies() {
+    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
+    let mut replies = vec![labels(), labels(), json!([]), json!({"id":3}), json!([])];
+    replies.extend((0..7).map(|_| json!({"id":99})));
+    replies.extend([lists(), board, lists()]);
+    let mock = Mock {
+        replies: Mutex::new(replies.into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow("Issueflow Workflow")
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .count(),
+        8
+    );
+    assert_eq!(calls[3].2.as_ref().unwrap()["name"], "Issueflow Workflow");
+    let label_ids: Vec<_> = calls
+        .iter()
+        .filter(|(method, endpoint, _)| *method == Method::POST && endpoint.ends_with("/lists"))
+        .map(|(_, _, body)| body.as_ref().unwrap()["label_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(label_ids, vec![1, 2, 3, 4, 5, 6, 7]);
+}
+
+#[tokio::test]
+async fn ambiguous_named_boards_stop_without_board_writes() {
+    let board = |id| json!({"id":id,"name":"Issueflow Workflow","lists":[]});
+    let mock = Mock {
+        replies: Mutex::new(vec![labels(), labels(), json!([board(2), board(3)])].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow("Issueflow Workflow")
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "conflict");
+    assert!(
+        mock.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+}
+
+#[tokio::test]
 async fn board_commands_reject_github_before_api_access() {
     let mock = Mock {
         replies: Mutex::new(vec![].into()),

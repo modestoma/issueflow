@@ -77,6 +77,18 @@ issueflow issue reopen https://gitlab.example.com/group/repo/-/issues/42
 
 GitLab transitions support triage, clarification, ready, in-progress and awaiting-review. Close reasons are completed/cancelled/duplicate/invalid, with workflow/resolution label maintenance; reopening returns to triage and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
 
+### GitLab Issue Boards
+
+Self-hosted GitLab workflows can use a project Issue Board whose columns are backed by the same `workflow::*` labels:
+
+```sh
+issueflow --platform gitlab --repository group/repo board list
+issueflow --platform gitlab --repository group/repo board show 3
+issueflow --platform gitlab --repository group/repo board init-workflow
+```
+
+`board init-workflow` uses the default name `Issueflow Workflow`; override it with `--name`. It ensures all workflow labels, reuses a unique exact-name board or creates one, adds only missing label lists, orders the seven workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
+
 ### Dependencies
 
 ```sh
