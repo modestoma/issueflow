@@ -170,3 +170,168 @@ fn remote_credentials_are_not_in_report() {
     );
     assert!(!inspect_local(&wt, &workflow()).unwrap().remote_matches);
 }
+
+struct CleanupRemote {
+    head: String,
+    merged: bool,
+    reachable: bool,
+    dependent: bool,
+}
+#[async_trait::async_trait]
+impl issueflow::transport::Transport for CleanupRemote {
+    async fn request(
+        &self,
+        method: http::Method,
+        endpoint: &str,
+        body: Option<serde_json::Value>,
+    ) -> issueflow::error::Result<serde_json::Value> {
+        if endpoint == "graphql" {
+            assert_eq!(method, http::Method::POST);
+            let body = body.unwrap();
+            let query = body["query"].as_str().unwrap();
+            assert!(query.starts_with("query"), "cleanup must never mutate");
+            return Ok(if query.contains("owner:user") {
+                json!({"data":{"owner":{"projectV2":{"id":"P1","closed":false,"title":"Board"}}}})
+            } else if query.contains("fields(first:") {
+                json!({"data":{"node":{"fields":{"nodes":[
+                    {"id":"S","name":"Status","options":[{"id":"D","name":"Done"}]},
+                    {"id":"T","name":"Work type","options":[]},
+                    {"id":"P","name":"Priority","options":[]},
+                    {"id":"B","name":"Blocked","options":[]},
+                    {"id":"R","name":"Resolution","options":[]}
+                ],"pageInfo":{"hasNextPage":false}}}}})
+            } else if query.contains("items(first:") {
+                json!({"data":{"node":{"items":{"nodes":[{
+                    "id":"ITEM1","content":{"id":"I1"},"isArchived":false,
+                    "fieldValueByName":{"name":"In review"},"resolution":null,
+                    "blocked":{"name":"No"}
+                }],"pageInfo":{"hasNextPage":false}}}}})
+            } else {
+                panic!("unexpected query: {query}");
+            });
+        }
+        assert_eq!(method, http::Method::GET, "cleanup must only read");
+        assert!(body.is_none());
+        Ok(if endpoint == "repos/a/b/issues/1" {
+            json!({"id":1,"node_id":"I1","number":1,"html_url":"https://github.com/a/b/issues/1","state":"open","state_reason":null,"labels":[]})
+        } else if endpoint == "repos/a/b/pulls/2" {
+            json!({"number":2,"html_url":"https://github.com/a/b/pull/2",
+                "state":if self.merged {"closed"} else {"open"},
+                "merged":self.merged,"draft":false,
+                "head":{"sha":self.head,"ref":"feat/issue-1","repo":{"full_name":"a/b"}},
+                "base":{"ref":"main"},"merge_commit_sha":"b".repeat(40),
+                "body":"Refs https://github.com/a/b/issues/1"})
+        } else if endpoint.starts_with("repos/a/b/compare/") {
+            json!({"status":if self.reachable {"ahead"} else {"diverged"},
+                "merge_base_commit":{"sha":"b".repeat(40)}})
+        } else if endpoint.starts_with("repos/a/b/pulls?") {
+            if self.dependent {
+                json!([{"id":3,"number":3}])
+            } else {
+                json!([])
+            }
+        } else {
+            panic!("unexpected endpoint: {endpoint}");
+        })
+    }
+}
+
+#[tokio::test]
+async fn cleanup_is_independent_of_acceptance_closure_and_project_sync() {
+    use issueflow::{
+        config::{Config, Overrides},
+        recovery::Recovery,
+        workflow_config::DeliveryPolicy,
+    };
+    let (_temp, _root, wt) = fixture();
+    let head = inspect_local(&wt, &workflow()).unwrap().head_sha;
+    let remote = CleanupRemote {
+        head,
+        merged: true,
+        reachable: true,
+        dependent: false,
+    };
+    let config =
+        Config::resolve(Default::default(), Default::default(), Overrides::default()).unwrap();
+    let mut workflow = workflow();
+    workflow.github_project_url = Some("https://github.com/users/a/projects/1".into());
+    let mut contract = contract();
+    contract.pr_url = Some("https://github.com/a/b/pull/2".into());
+    for (policy, accepted, phase) in [
+        (
+            DeliveryPolicy::AcceptanceRequired,
+            false,
+            "acceptance_pending",
+        ),
+        (
+            DeliveryPolicy::AcceptanceRequired,
+            true,
+            "reconciliation_needed",
+        ),
+        (DeliveryPolicy::Merged, false, "reconciliation_needed"),
+    ] {
+        workflow.delivery_policy = policy;
+        let recovery = Recovery {
+            config: &config,
+            transport: &remote,
+            contract: &contract,
+            parent: None,
+            workflow: &workflow,
+        };
+        let result = issueflow::cleanup::inspect(&recovery, &wt, true, accepted)
+            .await
+            .unwrap();
+        assert_eq!(result["eligible"], true, "{result}");
+        assert_eq!(result["remote_plan"]["phase"], phase);
+        assert_eq!(result["remote_snapshot"]["issue_state"], "open");
+        assert_eq!(result["remote_snapshot"]["project_status"], "In review");
+        assert_eq!(result["deleted"], false);
+        assert!(wt.join("README").exists());
+    }
+}
+
+#[tokio::test]
+async fn incomplete_merge_or_dependent_work_still_blocks_cleanup() {
+    use issueflow::{
+        config::{Config, Overrides},
+        recovery::Recovery,
+    };
+    let (_temp, _root, wt) = fixture();
+    let head = inspect_local(&wt, &workflow()).unwrap().head_sha;
+    let config =
+        Config::resolve(Default::default(), Default::default(), Overrides::default()).unwrap();
+    let workflow = workflow();
+    let mut contract = contract();
+    contract.pr_url = Some("https://github.com/a/b/pull/2".into());
+    for (merged, reachable, dependent, expected) in [
+        (false, true, false, "remote_delivery_not_complete"),
+        (true, false, false, "remote_delivery_not_complete"),
+        (true, true, true, "open_dependent_pull_requests"),
+    ] {
+        let remote = CleanupRemote {
+            head: head.clone(),
+            merged,
+            reachable,
+            dependent,
+        };
+        let recovery = Recovery {
+            config: &config,
+            transport: &remote,
+            contract: &contract,
+            parent: None,
+            workflow: &workflow,
+        };
+        let result = issueflow::cleanup::inspect(&recovery, &wt, true, false)
+            .await
+            .unwrap();
+        assert_eq!(result["eligible"], false);
+        assert!(
+            result["blockers"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(expected)),
+            "{result}"
+        );
+        assert_eq!(result["deleted"], false);
+    }
+}

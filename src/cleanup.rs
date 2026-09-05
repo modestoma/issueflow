@@ -146,7 +146,7 @@ pub fn blockers(
     local: &LocalState,
     contract: &BranchContract,
     reviewed_sha: Option<&str>,
-    remote_complete: bool,
+    merged_into_target: bool,
     dependent_prs: usize,
     confirmed: bool,
 ) -> Vec<&'static str> {
@@ -175,7 +175,7 @@ pub fn blockers(
     if reviewed_sha != Some(local.head_sha.as_str()) {
         b.push("local_head_differs_from_reviewed_pr");
     }
-    if !remote_complete {
+    if !merged_into_target {
         b.push("remote_delivery_not_complete");
     }
     if dependent_prs > 0 {
@@ -215,11 +215,11 @@ pub async fn inspect(
         &local,
         recovery.contract,
         snapshot.head_sha.as_deref(),
-        plan.phase == "complete",
+        snapshot.pr_merged && snapshot.pr_state.as_deref() == Some("closed") && snapshot.delivered,
         count,
         confirmed,
     );
     Ok(
-        json!({"eligible":reasons.is_empty(),"blockers":reasons,"local":local,"remote_snapshot":snapshot,"remote_plan":plan,"open_dependent_prs":dependent,"deleted":false,"note":"Read-only eligibility report, never a deletion command or authorization. Open PRs do not reveal unpublished child work; confirm child issue/worktree dependencies separately. Ignored files including build output and credentials require review. Recheck immediately before any explicitly authorized cleanup."}),
+        json!({"eligible":reasons.is_empty(),"blockers":reasons,"local":local,"remote_snapshot":snapshot,"remote_plan":plan,"open_dependent_prs":dependent,"deleted":false,"note":"Read-only eligibility report, never a deletion command or authorization. Eligibility does not require issue closure, human acceptance or completed Project fields. Preserve any worktree still needed for acceptance. Open PRs do not reveal unpublished child work; confirm child issue/worktree dependencies separately. Ignored files including build output and credentials require review. Recheck immediately before any explicitly authorized cleanup."}),
     )
 }
