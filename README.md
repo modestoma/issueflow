@@ -201,6 +201,30 @@ Merging does not invoke issue closure, delete branches, or set Project Status. V
 
 Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
 
+### Validate parent/child branch contracts
+
+```sh
+issueflow workflow validate-contract --file child.json --parent-file parent.json
+```
+
+A contract is a small JSON artifact that can be kept in the issue body and materialized temporarily for validation; no local issue registry is required:
+
+```json
+{
+  "schema_version": 1,
+  "issue_url": "https://github.com/owner/repo/issues/12",
+  "parent_issue_url": "https://github.com/owner/repo/issues/10",
+  "source_branch": "feat/issue-10-parent",
+  "branch": "feat/issue-12-child",
+  "pr_target": "feat/issue-10-parent",
+  "pr_url": null
+}
+```
+
+The parent file uses the same schema with its own issue URL/branch and original target; a root uses `parent_issue_url: null`. Validation requires source and PR target to agree, distinct development/target branches, same-repository issue/PR URLs, and a child's target to equal the supplied parent's branch. A child without its parent file is not considered validated. Unknown fields are rejected. This runs offline and never loads credentials or mutates branches.
+
+The result explicitly sets `remote_verified: false`: local validation does not prove branches exist, inspect actual PR targets, grant merge permission, or validate a full ancestor graph. Read the actual PR before merging and compare its head/base with the contract. The parent still needs overall acceptance after its children deliver.
+
 ## Output and errors
 
 Successful commands write JSON to stdout; errors write JSON to stderr. Normalized issue results contain `platform`, `id`, `number`, `url`, `title`, `body`, `state`, `labels`, `created_at`, and `updated_at`. `id` is the platform-wide ID; `number` is the repository's native issue number (GitLab `iid`). Comments and dependencies retain platform-native JSON.

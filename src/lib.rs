@@ -1,3 +1,4 @@
+pub mod branch_contract;
 pub mod config;
 pub mod error;
 pub mod project;

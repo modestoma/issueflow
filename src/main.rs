@@ -52,6 +52,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WorkflowCommand {
+    ValidateContract {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        parent_file: Option<PathBuf>,
+    },
     Validate {
         #[arg(long, default_value = ".issue-workflow.json")]
         file: PathBuf,
@@ -442,6 +448,17 @@ async fn main() -> ExitCode {
             return finish(Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
             ));
+        }
+        Command::Workflow(WorkflowCommand::ValidateContract { file, parent_file }) => {
+            let result = (|| {
+                let c = input::<issueflow::branch_contract::BranchContract>(file)?;
+                let parent = parent_file
+                    .as_ref()
+                    .map(|p| input::<issueflow::branch_contract::BranchContract>(p))
+                    .transpose()?;
+                c.validate(parent.as_ref())
+            })();
+            return finish(result);
         }
         Command::Workflow(WorkflowCommand::Validate { file }) => {
             return finish(
