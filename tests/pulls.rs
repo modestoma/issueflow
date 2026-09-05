@@ -3,7 +3,7 @@ use http::Method;
 use issueflow::{
     config::{Config, Overrides, Platform},
     error::Result,
-    pull::{CreatePull, MergeMethod, Pulls, target_from_url},
+    pull::{CreatePull, MergeMethod, Pulls, UpdatePull, target_from_url},
     service::{CloseReason, Service},
     target::Target,
     transport::Transport,
@@ -40,6 +40,27 @@ impl Transport for Mock {
 fn cfg() -> Config {
     Config::resolve(HashMap::new(), HashMap::new(), Overrides::default()).unwrap()
 }
+fn gitlab_cfg() -> Config {
+    Config::resolve(
+        HashMap::new(),
+        HashMap::from([(
+            "ISSUEFLOW_GITLAB_URL".into(),
+            "https://gitlab.example/tools".into(),
+        )]),
+        Overrides::default(),
+    )
+    .unwrap()
+}
+fn gitlab_target() -> Target {
+    Target {
+        platform: Platform::Gitlab,
+        repository: "group/sub/repo".into(),
+        number: Some(9),
+    }
+}
+fn mr() -> Value {
+    json!({"id":90,"iid":9,"state":"opened","draft":false,"title":"Add feature","description":"Refs https://gitlab.example/tools/group/sub/repo/-/issues/5","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","diff_refs":{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source_branch":"feat/issue-5","target_branch":"feat/parent","source_project_id":4,"target_project_id":4})
+}
 fn target() -> Target {
     Target {
         platform: Platform::Github,
@@ -68,6 +89,134 @@ fn validates_pr_url() {
     ] {
         assert!(target_from_url(&cfg(), s).is_err());
     }
+}
+#[test]
+fn validates_configured_gitlab_mr_url() {
+    let target = target_from_url(
+        &gitlab_cfg(),
+        "https://gitlab.example/tools/group/sub/repo/-/merge_requests/9",
+    )
+    .unwrap();
+    assert_eq!(target.platform, Platform::Gitlab);
+    assert_eq!(target.repository, "group/sub/repo");
+    assert_eq!(target.number, Some(9));
+    assert!(
+        target_from_url(
+            &gitlab_cfg(),
+            "https://evil.example/tools/group/sub/repo/-/merge_requests/9"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn validates_gitlab_mr_url_with_non_default_port() {
+    let config = Config::resolve(
+        HashMap::new(),
+        HashMap::from([(
+            "ISSUEFLOW_GITLAB_URL".into(),
+            "https://gitlab.example:8443".into(),
+        )]),
+        Overrides::default(),
+    )
+    .unwrap();
+    let target = target_from_url(
+        &config,
+        "https://gitlab.example:8443/group/repo/-/merge_requests/9",
+    )
+    .unwrap();
+    assert_eq!(target.repository, "group/repo");
+}
+#[tokio::test]
+async fn gitlab_create_maps_fields_and_reads_back() {
+    let m = Mock::new(vec![
+        json!({"id":5,"iid":5,"title":"Issue","description":"Body","state":"opened","labels":[],"created_at":"now","updated_at":"now","web_url":"https://gitlab.example/tools/group/sub/repo/-/issues/5"}),
+        json!([]),
+        json!({"iid":9}),
+        mr(),
+    ]);
+    let v = Pulls {
+        transport: &m,
+        target: gitlab_target(),
+    }
+    .create(
+        input(),
+        "https://gitlab.example/tools/group/sub/repo/-/issues/5",
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["reused"], false);
+    let calls = m.calls.lock().unwrap();
+    assert_eq!(
+        calls[1].1,
+        "projects/group%2Fsub%2Frepo/merge_requests?state=opened&order_by=created_at&sort=asc&source_branch=feat%2Fissue-5&target_branch=feat%2Fparent&per_page=100&page=1"
+    );
+    let payload = calls[2].2.as_ref().unwrap();
+    assert_eq!(payload["source_branch"], "feat/issue-5");
+    assert_eq!(payload["target_branch"], "feat/parent");
+    assert!(
+        payload["description"]
+            .as_str()
+            .unwrap()
+            .contains("Refs https://")
+    );
+}
+#[tokio::test]
+async fn gitlab_update_uses_put_and_preserves_reference() {
+    let mut edited = mr();
+    edited["description"] =
+        json!("Changed\n\nRefs https://gitlab.example/tools/group/sub/repo/-/issues/5");
+    let m = Mock::new(vec![mr(), json!({}), edited]);
+    Pulls {
+        transport: &m,
+        target: gitlab_target(),
+    }
+    .update(
+        UpdatePull {
+            title: None,
+            body: Some("Changed".into()),
+        },
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .await
+    .unwrap();
+    let calls = m.calls.lock().unwrap();
+    assert_eq!(calls[1].0, Method::PUT);
+    assert!(
+        calls[1].2.as_ref().unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .contains("Refs https://")
+    );
+}
+#[tokio::test]
+async fn gitlab_merge_sends_expected_sha_and_verifies() {
+    let mut merged = mr();
+    merged["state"] = json!("merged");
+    merged["merged_at"] = json!("now");
+    let m = Mock::new(vec![mr(), merged.clone(), merged]);
+    let v = Pulls {
+        transport: &m,
+        target: gitlab_target(),
+    }
+    .merge(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "feat/parent",
+        MergeMethod::Squash,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["merged"], true);
+    let calls = m.calls.lock().unwrap();
+    assert_eq!(
+        calls[1].1,
+        "projects/group%2Fsub%2Frepo/merge_requests/9/merge"
+    );
+    assert_eq!(
+        calls[1].2.as_ref().unwrap()["sha"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(calls[1].2.as_ref().unwrap()["squash"], true);
 }
 #[tokio::test]
 async fn child_pr_targets_parent_and_links_issue_without_closing() {
@@ -250,7 +399,6 @@ async fn native_close_and_reopen_preserve_labels() {
 
 #[tokio::test]
 async fn update_preserves_reference_and_unspecified_title() {
-    use issueflow::pull::UpdatePull;
     let mut edited = pr();
     edited["body"] = json!("New plan\n\nRefs https://github.com/owner/repo/issues/5");
     let m = Mock::new(vec![pr(), json!({}), edited]);

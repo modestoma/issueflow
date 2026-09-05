@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 #[derive(Serialize, Default, Clone)]
 pub struct Snapshot {
+    pub label_workflow: bool,
     pub issue_state: String,
     pub issue_reason: Option<String>,
     pub has_resolution: bool,
@@ -55,10 +56,10 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
         actions: vec![],
         blockers: vec![reason],
     };
-    if !s.project_configured {
+    if !s.label_workflow && !s.project_configured {
         return stop("setup_required", "github_project_required");
     }
-    if !s.metadata_ready {
+    if !s.label_workflow && !s.metadata_ready {
         return stop("setup_required", "project_workflow_fields_required");
     }
     if s.project_blocked {
@@ -99,11 +100,11 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
     if !s.delivered {
         return stop("delivery_pending", "merge_not_reachable_from_target");
     }
-    if s.project_configured && !s.done_option_available {
+    if !s.label_workflow && s.project_configured && !s.done_option_available {
         return stop("manual_review", "project_done_option_missing_or_ambiguous");
     }
     let mut actions = Vec::new();
-    if s.project_configured {
+    if !s.label_workflow && s.project_configured {
         if !s.in_project {
             actions.push("add_to_project");
         }
@@ -118,7 +119,7 @@ pub fn plan(s: &Snapshot, policy: DeliveryPolicy, accepted: bool) -> Plan {
             blockers: vec!["human_acceptance_required"],
         };
     }
-    if s.resolution.as_deref() != Some("Completed") {
+    if !s.label_workflow && s.resolution.as_deref() != Some("Completed") {
         actions.push("set_resolution_completed");
     }
     if s.issue_state != "closed" {
@@ -154,7 +155,7 @@ impl Recovery<'_> {
         self.workflow.validate()?;
         self.contract.validate(self.parent)?;
         let t = Target::from_url(self.config, &self.contract.issue_url)?;
-        if t.platform != Platform::Github
+        if t.platform != self.workflow.platform()?
             || !t.repository.eq_ignore_ascii_case(&self.workflow.repository)
         {
             return Err(Error::new(
@@ -185,10 +186,39 @@ impl Recovery<'_> {
         .raw_issue()
         .await?;
         let mut s = Snapshot {
-            issue_state: issue["state"].as_str().ok_or_else(bad)?.into(),
+            label_workflow: t.platform == Platform::Gitlab,
+            issue_state: match issue["state"].as_str().ok_or_else(bad)? {
+                "opened" => "open".into(),
+                value => value.into(),
+            },
             issue_reason: issue["state_reason"].as_str().map(String::from),
             ..Default::default()
         };
+        if t.platform == Platform::Gitlab {
+            let labels = issue["labels"].as_array().ok_or_else(bad)?;
+            let names: Vec<_> = labels.iter().filter_map(Value::as_str).collect();
+            let stages: Vec<_> = names
+                .iter()
+                .filter(|name| name.starts_with("workflow::"))
+                .collect();
+            if stages.len() != 1 {
+                return Err(Error::new(
+                    "conflict",
+                    "GitLab issue must have exactly one workflow stage label",
+                ));
+            }
+            s.project_blocked = names.contains(&"blocked");
+            s.has_resolution = names.iter().any(|name| name.starts_with("resolution::"));
+            s.metadata_ready = true;
+            s.done_option_available = true;
+            s.project_configured = true;
+            s.in_project = true;
+            s.project_status = Some((*stages[0]).to_string());
+            if names.contains(&"workflow::Done") {
+                s.resolution = Some("Completed".into());
+                s.issue_reason = Some("completed".into());
+            }
+        }
         let pr_target = if let Some(url) = &self.contract.pr_url {
             Some(target_from_url(self.config, url)?)
         } else {
@@ -206,12 +236,19 @@ impl Recovery<'_> {
                 .as_array()
                 .ok_or_else(bad)?
                 .iter()
-                .filter(|p| {
-                    p["head"]["ref"] == self.contract.branch
-                        && p["base"]["ref"] == self.contract.pr_target
-                        && p["head"]["repo"]["full_name"]
-                            .as_str()
-                            .is_some_and(|r| r.eq_ignore_ascii_case(&t.repository))
+                .filter(|p| match t.platform {
+                    Platform::Github => {
+                        p["head"]["ref"] == self.contract.branch
+                            && p["base"]["ref"] == self.contract.pr_target
+                            && p["head"]["repo"]["full_name"]
+                                .as_str()
+                                .is_some_and(|r| r.eq_ignore_ascii_case(&t.repository))
+                    }
+                    Platform::Gitlab => {
+                        p["source_branch"] == self.contract.branch
+                            && p["target_branch"] == self.contract.pr_target
+                            && p["source_project_id"] == p["target_project_id"]
+                    }
                 })
                 .collect();
             if candidates.len() > 1 {
@@ -222,7 +259,15 @@ impl Recovery<'_> {
             }
             if let Some(p) = candidates.first() {
                 let mut target = t.clone();
-                target.number = Some(p["number"].as_u64().ok_or_else(bad)?);
+                target.number = Some(
+                    p[if t.platform == Platform::Github {
+                        "number"
+                    } else {
+                        "iid"
+                    }]
+                    .as_u64()
+                    .ok_or_else(bad)?,
+                );
                 Some(target)
             } else {
                 None
@@ -241,56 +286,144 @@ impl Recovery<'_> {
             }
             .show()
             .await?;
-            if pr["head"]["ref"] != self.contract.branch
-                || pr["base"]["ref"] != self.contract.pr_target
-                || !pr["head"]["repo"]["full_name"]
-                    .as_str()
-                    .is_some_and(|r| r.eq_ignore_ascii_case(&t.repository))
-            {
+            let branches_match = match t.platform {
+                Platform::Github => {
+                    pr["head"]["ref"] == self.contract.branch
+                        && pr["base"]["ref"] == self.contract.pr_target
+                        && pr["head"]["repo"]["full_name"]
+                            .as_str()
+                            .is_some_and(|r| r.eq_ignore_ascii_case(&t.repository))
+                }
+                Platform::Gitlab => {
+                    pr["source_branch"] == self.contract.branch
+                        && pr["target_branch"] == self.contract.pr_target
+                        && pr["source_project_id"] == pr["target_project_id"]
+                }
+            };
+            if !branches_match {
                 return Err(Error::new(
                     "conflict",
                     "Actual PR branches differ from the issue contract",
                 ));
             }
             let reference = format!("Refs {}", self.contract.issue_url);
-            if !pr["body"]
-                .as_str()
-                .unwrap_or("")
-                .lines()
-                .any(|l| l == reference)
+            if !pr[if t.platform == Platform::Github {
+                "body"
+            } else {
+                "description"
+            }]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .any(|l| l == reference)
             {
                 return Err(Error::new(
                     "conflict",
                     "PR does not contain the contract's issue reference",
                 ));
             }
-            s.pr_state = Some(pr["state"].as_str().ok_or_else(bad)?.into());
-            s.pr_merged = pr["merged"].as_bool().ok_or_else(bad)?;
-            s.pr_draft = pr["draft"].as_bool().ok_or_else(bad)?;
-            s.head_sha = Some(sha(&pr["head"]["sha"])?.into());
-            s.pr_url = Some(pr["html_url"].as_str().ok_or_else(bad)?.into());
+            s.pr_state = Some(
+                match pr["state"].as_str().ok_or_else(bad)? {
+                    "opened" => "open",
+                    "merged" => "closed",
+                    value => value,
+                }
+                .into(),
+            );
+            s.pr_merged = if t.platform == Platform::Github {
+                pr["merged"].as_bool().ok_or_else(bad)?
+            } else {
+                pr["state"] == "merged" && pr["merged_at"].is_string()
+            };
+            s.pr_draft = pr["draft"]
+                .as_bool()
+                .or_else(|| pr["work_in_progress"].as_bool())
+                .ok_or_else(bad)?;
+            s.head_sha = Some(
+                sha(if t.platform == Platform::Github {
+                    &pr["head"]["sha"]
+                } else {
+                    &pr["sha"]
+                })?
+                .into(),
+            );
+            s.pr_url = Some(
+                pr[if t.platform == Platform::Github {
+                    "html_url"
+                } else {
+                    "web_url"
+                }]
+                .as_str()
+                .ok_or_else(bad)?
+                .into(),
+            );
             if s.pr_merged {
                 if s.pr_state.as_deref() != Some("closed") {
                     return Err(bad());
                 }
-                let merge = sha(&pr["merge_commit_sha"])?;
-                let compare = self
-                    .transport
-                    .request(
-                        Method::GET,
-                        &format!(
-                            "repos/{}/compare/{merge}...{}",
-                            t.repository,
-                            encode(&self.contract.pr_target)
-                        ),
-                        None,
-                    )
-                    .await?;
-                s.delivered = matches!(compare["status"].as_str(), Some("ahead" | "identical"))
-                    && compare["merge_base_commit"]["sha"].as_str() == Some(merge);
+                if t.platform == Platform::Github {
+                    let merge = sha(&pr["merge_commit_sha"])?;
+                    let compare = self
+                        .transport
+                        .request(
+                            Method::GET,
+                            &format!(
+                                "repos/{}/compare/{merge}...{}",
+                                t.repository,
+                                encode(&self.contract.pr_target)
+                            ),
+                            None,
+                        )
+                        .await?;
+                    s.delivered = matches!(compare["status"].as_str(), Some("ahead" | "identical"))
+                        && compare["merge_base_commit"]["sha"].as_str() == Some(merge);
+                } else {
+                    let merge = sha(&pr["merge_commit_sha"])?;
+                    let root = format!(
+                        "projects/{}/repository/commits/{}/refs?type=branch",
+                        encode(&t.repository),
+                        encode(merge)
+                    );
+                    let mut names = std::collections::BTreeSet::new();
+                    for page in 1..=1000 {
+                        let refs = self
+                            .transport
+                            .request(
+                                Method::GET,
+                                &format!("{root}&per_page=100&page={page}"),
+                                None,
+                            )
+                            .await?;
+                        let refs = refs.as_array().ok_or_else(bad)?;
+                        for reference in refs {
+                            if reference["type"] != "branch" {
+                                return Err(bad());
+                            }
+                            let name = reference["name"].as_str().ok_or_else(bad)?;
+                            if !names.insert(name.to_string()) {
+                                return Err(Error::new(
+                                    "conflict",
+                                    "GitLab commit references changed during pagination",
+                                ));
+                            }
+                        }
+                        if refs.len() < 100 {
+                            break;
+                        }
+                        if page == 1000 {
+                            return Err(Error::new(
+                                "response",
+                                "GitLab commit reference pagination limit exceeded",
+                            ));
+                        }
+                    }
+                    s.delivered = names.contains(&self.contract.pr_target);
+                }
             }
         }
-        if let Some(project) = self.project()? {
+        if t.platform == Platform::Github
+            && let Some(project) = self.project()?
+        {
             s.project_configured = true;
             let value = project.items().await?;
             let fields = value["project"]["fields"].as_array().ok_or_else(bad)?;
@@ -422,7 +555,7 @@ impl Recovery<'_> {
                         transport: self.transport,
                         target: self.target()?,
                     }
-                    .native_state(Some(CloseReason::Completed))
+                    .close(CloseReason::Completed)
                     .await
                 }
                 _ => return Err(bad()),

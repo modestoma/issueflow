@@ -199,3 +199,33 @@ async fn projects_use_sdk_graphql_post_and_classify_permission_errors() {
             .contains("owner:user(login:$owner)")
     );
 }
+
+#[tokio::test]
+async fn gitlab_graphql_uses_instance_base_path_and_private_token() {
+    let (address, server) = server(
+        200,
+        r#"{"data":{"workItem":{"id":"gid://gitlab/WorkItem/1"}}}"#,
+        "",
+    );
+    let transport =
+        SdkTransport::new(&config(Platform::Gitlab, &address), Platform::Gitlab).unwrap();
+    let result = transport
+        .request(
+            Method::POST,
+            "graphql",
+            Some(json!({"query":"query { workItem { id } }"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["data"]["workItem"]["id"], "gid://gitlab/WorkItem/1");
+    let request = server.join().unwrap();
+    assert!(
+        request.starts_with("POST /tools/api/graphql? "),
+        "{request}"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("private-token: sdk-test-secret")
+    );
+}

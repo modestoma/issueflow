@@ -1,11 +1,23 @@
 use crate::{
-    config::{Config, Overrides, Platform},
+    config::{Config, Overrides},
     error::{Error, Result},
     target::Target,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+fn config_for_url(value: &str) -> Result<Config> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| Error::new("input", "Invalid issue URL in branch contract"))?;
+    let mut environment = HashMap::new();
+    if value.contains("/-/issues/") || value.contains("/-/merge_requests/") {
+        environment.insert(
+            "ISSUEFLOW_GITLAB_URL".into(),
+            parsed.origin().ascii_serialization(),
+        );
+    }
+    Config::resolve(HashMap::new(), environment, Overrides::default()).map_err(Error::from)
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BranchContract {
@@ -22,7 +34,7 @@ impl BranchContract {
         let invalid = || {
             Error::new(
                 "input",
-                "Invalid branch contract: use distinct development and target branches in one GitHub repository",
+                "Invalid branch contract: use distinct development and target branches in one repository",
             )
         };
         if self.schema_version != 1
@@ -34,12 +46,8 @@ impl BranchContract {
         for name in [&self.branch, &self.source_branch, &self.pr_target] {
             crate::pull::branch(name).map_err(|_| invalid())?;
         }
-        let cfg = Config::resolve(HashMap::new(), HashMap::new(), Overrides::default())
-            .map_err(Error::from)?;
+        let cfg = config_for_url(&self.issue_url)?;
         let issue = Target::from_url(&cfg, &self.issue_url)?;
-        if issue.platform != Platform::Github {
-            return Err(invalid());
-        }
         if let Some(url) = &self.pr_url {
             let pr = crate::pull::target_from_url(&cfg, url)?;
             if !pr.repository.eq_ignore_ascii_case(&issue.repository) {
@@ -66,8 +74,7 @@ impl BranchContract {
             }
             (Some(url), Some(parent)) => {
                 let p = parent.basic()?;
-                let cfg = Config::resolve(HashMap::new(), HashMap::new(), Overrides::default())
-                    .map_err(Error::from)?;
+                let cfg = config_for_url(url)?;
                 let expected = Target::from_url(&cfg, url)?;
                 if expected != p
                     || issue == p

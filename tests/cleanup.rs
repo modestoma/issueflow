@@ -335,3 +335,74 @@ async fn incomplete_merge_or_dependent_work_still_blocks_cleanup() {
         assert_eq!(result["deleted"], false);
     }
 }
+
+struct GitlabCleanupRemote {
+    head: String,
+}
+#[async_trait::async_trait]
+impl issueflow::transport::Transport for GitlabCleanupRemote {
+    async fn request(
+        &self,
+        method: http::Method,
+        endpoint: &str,
+        body: Option<serde_json::Value>,
+    ) -> issueflow::error::Result<serde_json::Value> {
+        assert_eq!(method, http::Method::GET);
+        assert!(body.is_none());
+        Ok(if endpoint == "projects/group%2Frepo/issues/1" {
+            json!({"id":1,"iid":1,"title":"Issue","description":"Body","created_at":"now","updated_at":"now","web_url":"https://gitlab.example/group/repo/-/issues/1","state":"opened","labels":["type::feature","priority::P1","workflow::In review"]})
+        } else if endpoint == "projects/group%2Frepo/merge_requests/2" {
+            json!({"id":2,"iid":2,"web_url":"https://gitlab.example/group/repo/-/merge_requests/2","state":"merged","merged_at":"now","draft":false,"sha":self.head,"source_branch":"feat/issue-1","target_branch":"main","source_project_id":7,"target_project_id":7,"merge_commit_sha":"b".repeat(40),"description":"Refs https://gitlab.example/group/repo/-/issues/1"})
+        } else if endpoint.starts_with("projects/group%2Frepo/repository/commits/") {
+            json!([{"type":"branch","name":"main"}])
+        } else if endpoint.starts_with("projects/group%2Frepo/merge_requests?state=opened") {
+            json!([])
+        } else {
+            panic!("unexpected endpoint: {endpoint}")
+        })
+    }
+}
+
+#[tokio::test]
+async fn gitlab_cleanup_uses_merged_mr_and_dependent_mr_evidence() {
+    use issueflow::{
+        config::{Config, Overrides},
+        recovery::Recovery,
+    };
+    let (_temp, _root, wt) = fixture();
+    git(
+        &wt,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@gitlab.example:group/repo.git",
+        ],
+    );
+    let workflow: WorkflowConfig = serde_json::from_value(json!({"schema_version":1,"platform":"gitlab","host":"gitlab.example","repository":"group/repo","remote":"origin","base_branch":"main","timezone":"Asia/Shanghai","permissions":{"local_commit":true,"push":true,"pull_request":true},"delivery_policy":"merged"})).unwrap();
+    let contract: BranchContract = serde_json::from_value(json!({"schema_version":1,"issue_url":"https://gitlab.example/group/repo/-/issues/1","source_branch":"main","branch":"feat/issue-1","pr_target":"main","pr_url":"https://gitlab.example/group/repo/-/merge_requests/2"})).unwrap();
+    let head = inspect_local(&wt, &workflow).unwrap().head_sha;
+    let config = Config::resolve(
+        Default::default(),
+        std::collections::HashMap::from([(
+            "ISSUEFLOW_GITLAB_URL".into(),
+            "https://gitlab.example".into(),
+        )]),
+        Overrides::default(),
+    )
+    .unwrap();
+    let remote = GitlabCleanupRemote { head };
+    let recovery = Recovery {
+        config: &config,
+        transport: &remote,
+        contract: &contract,
+        parent: None,
+        workflow: &workflow,
+    };
+    let result = issueflow::cleanup::inspect(&recovery, &wt, true, false)
+        .await
+        .unwrap();
+    assert_eq!(result["eligible"], true, "{result}");
+    assert_eq!(result["open_dependent_prs"], json!([]));
+    assert_eq!(result["deleted"], false);
+}

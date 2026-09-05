@@ -12,20 +12,35 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Stage {
-    Triage,
-    Clarification,
+    Backlog,
     Ready,
     InProgress,
-    AwaitingReview,
+    InReview,
 }
+pub const WORKFLOW_STAGE_LABELS: [&str; 6] = [
+    "workflow::Backlog",
+    "workflow::Ready",
+    "workflow::In progress",
+    "workflow::In review",
+    "workflow::Done",
+    "workflow::Cancelled",
+];
+pub const LEGACY_WORKFLOW_STAGE_LABELS: [&str; 7] = [
+    "workflow::待复查",
+    "workflow::待明确",
+    "workflow::就绪",
+    "workflow::开发中",
+    "workflow::待验收",
+    "workflow::已完成",
+    "workflow::已终止",
+];
 impl Stage {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Triage => "workflow::待复查",
-            Self::Clarification => "workflow::待明确",
-            Self::Ready => "workflow::就绪",
-            Self::InProgress => "workflow::开发中",
-            Self::AwaitingReview => "workflow::待验收",
+            Self::Backlog => "workflow::Backlog",
+            Self::Ready => "workflow::Ready",
+            Self::InProgress => "workflow::In progress",
+            Self::InReview => "workflow::In review",
         }
     }
 }
@@ -401,6 +416,107 @@ impl Service<'_> {
         }
         self.set_stage(stage.label(), vec![], vec![]).await
     }
+    pub async fn reconcile_metadata(&self, apply: bool) -> Result<Value> {
+        if self.gh() {
+            return Err(Error::new(
+                "input",
+                "GitHub workflow metadata is reconciled through Project fields",
+            ));
+        }
+        let current = self.raw_issue().await?;
+        let current_labels = labels(&current)?;
+        for prefix in ["type::", "priority::"] {
+            if current_labels
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .count()
+                != 1
+            {
+                return Err(Error::new(
+                    "conflict",
+                    "GitLab workflow metadata requires exactly one type and one priority",
+                ));
+            }
+        }
+        let stages: Vec<_> = current_labels
+            .iter()
+            .filter(|name| {
+                WORKFLOW_STAGE_LABELS.contains(&name.as_str())
+                    || LEGACY_WORKFLOW_STAGE_LABELS.contains(&name.as_str())
+            })
+            .collect();
+        if stages.len() != 1 {
+            return Err(Error::new(
+                "conflict",
+                "GitLab issue must have exactly one canonical or legacy workflow stage",
+            ));
+        }
+        let (stage, clarification) = match stages[0].as_str() {
+            "workflow::待复查" => ("workflow::Backlog", false),
+            "workflow::待明确" => ("workflow::Backlog", true),
+            "workflow::就绪" => ("workflow::Ready", false),
+            "workflow::开发中" => ("workflow::In progress", false),
+            "workflow::待验收" => ("workflow::In review", false),
+            "workflow::已完成" => ("workflow::Done", false),
+            "workflow::已终止" => ("workflow::Cancelled", false),
+            value => (
+                value,
+                current_labels
+                    .iter()
+                    .any(|label| label == "needs-clarification"),
+            ),
+        };
+        let mut add = BTreeSet::from([stage.to_string()]);
+        let mut remove: BTreeSet<String> = current_labels
+            .iter()
+            .filter(|label| LEGACY_WORKFLOW_STAGE_LABELS.contains(&label.as_str()))
+            .cloned()
+            .collect();
+        if clarification {
+            add.insert("needs-clarification".into());
+        }
+        for (legacy, canonical) in [
+            ("resolution::取消", "resolution::Cancelled"),
+            ("resolution::重复", "resolution::Duplicate"),
+            ("resolution::失效", "resolution::Invalid"),
+        ] {
+            if current_labels.iter().any(|label| label == legacy) {
+                remove.insert(legacy.into());
+                add.insert(canonical.into());
+            }
+        }
+        let dependencies = self.dependencies().await?;
+        let blockers = dependencies
+            .as_array()
+            .ok_or_else(|| Error::new("response", "Invalid dependency response"))?;
+        let unresolved = blockers.iter().any(|blocker| {
+            let labels = blocker["labels"].as_array();
+            blocker["state"] == "opened"
+                || !labels.is_some_and(|labels| {
+                    labels
+                        .iter()
+                        .any(|label| label.as_str() == Some("workflow::Done"))
+                })
+        });
+        if unresolved {
+            add.insert("blocked".into());
+        } else if current_labels.iter().any(|label| label == "blocked") {
+            remove.insert("blocked".into());
+        }
+        add.retain(|label| !current_labels.contains(label));
+        remove.retain(|label| current_labels.contains(label));
+        let add: Vec<_> = add.into_iter().collect();
+        let remove: Vec<_> = remove.into_iter().collect();
+        if !apply || (add.is_empty() && remove.is_empty()) {
+            return Ok(
+                json!({"applied":false,"add":add,"remove":remove,"dependencies":dependencies,"issue":normalize(&current,self.target.platform)?}),
+            );
+        }
+        let issue = self.labels(add.clone(), remove.clone()).await?;
+        Ok(
+            json!({"applied":true,"add":add,"remove":remove,"dependencies":dependencies,"issue":issue}),
+        )
+    }
     /// Change native state without touching any labels (for Project-backed workflows).
     pub async fn native_state(&self, reason: Option<CloseReason>) -> Result<Value> {
         self.raw_issue().await?;
@@ -439,9 +555,9 @@ impl Service<'_> {
             .collect();
         let resolution = match reason {
             CloseReason::Completed => None,
-            CloseReason::Cancelled => Some("resolution::取消"),
-            CloseReason::Duplicate => Some("resolution::重复"),
-            CloseReason::Invalid => Some("resolution::失效"),
+            CloseReason::Cancelled => Some("resolution::Cancelled"),
+            CloseReason::Duplicate => Some("resolution::Duplicate"),
+            CloseReason::Invalid => Some("resolution::Invalid"),
         };
         let removes = old_resolutions
             .into_iter()
@@ -449,9 +565,9 @@ impl Service<'_> {
             .collect();
         self.set_stage(
             if resolution.is_none() {
-                "workflow::已完成"
+                "workflow::Done"
             } else {
-                "workflow::已终止"
+                "workflow::Cancelled"
             },
             resolution.into_iter().map(String::from).collect(),
             removes,
@@ -487,7 +603,7 @@ impl Service<'_> {
             .into_iter()
             .filter(|s| s.starts_with("resolution::"))
             .collect();
-        self.set_stage("workflow::待复查", vec![], remove)
+        self.set_stage("workflow::Backlog", vec![], remove)
             .await
             .map_err(partial)
     }
@@ -505,17 +621,17 @@ impl Service<'_> {
         let existing = self.pages(&endpoint).await?;
         let mut created = Vec::new();
         for name in [
-            "workflow::待复查",
-            "workflow::待明确",
-            "workflow::就绪",
-            "workflow::开发中",
-            "workflow::待验收",
-            "workflow::已完成",
-            "workflow::已终止",
+            "workflow::Backlog",
+            "workflow::Ready",
+            "workflow::In progress",
+            "workflow::In review",
+            "workflow::Done",
+            "workflow::Cancelled",
+            "needs-clarification",
             "blocked",
-            "resolution::取消",
-            "resolution::重复",
-            "resolution::失效",
+            "resolution::Cancelled",
+            "resolution::Duplicate",
+            "resolution::Invalid",
             "type::bug",
             "type::feature",
             "type::improvement",

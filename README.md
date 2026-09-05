@@ -2,7 +2,7 @@
 
 A Rust CLI for managing GitHub and GitLab issues. It accesses platform APIs directly through SDKs, without requiring `gh`, `glab`, or Python.
 
-Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; and managing native blocking dependencies. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
+Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; managing native blocking dependencies; and delivering GitHub pull requests or same-project GitLab merge requests. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
 
 ## Build and usage
 
@@ -75,7 +75,28 @@ issueflow issue close https://gitlab.example.com/group/repo/-/issues/42 --reason
 issueflow issue reopen https://gitlab.example.com/group/repo/-/issues/42
 ```
 
-GitLab transitions support triage, clarification, ready, in-progress and awaiting-review. Close reasons are completed/cancelled/duplicate/invalid, with workflow/resolution label maintenance; reopening returns to triage and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
+GitLab uses the same six-stage model as GitHub: Backlog, Ready, In progress, In review, Done, and Cancelled. Open transitions support backlog, ready, in-progress, and in-review; close reasons are completed/cancelled/duplicate/invalid, with canonical workflow/resolution label maintenance. Clarification is the orthogonal `needs-clarification` label. Reopening returns to Backlog and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
+
+Existing installations can inspect one GitLab issue at a time before migrating legacy labels:
+
+```sh
+issueflow issue reconcile-metadata ISSUE_URL
+issueflow issue reconcile-metadata ISSUE_URL --apply
+```
+
+The command maps the seven legacy Chinese workflow labels to the six canonical stages, preserves clarification separately, maps legacy resolution labels to English values, and derives `blocked` from native blocking relationships. Preview is the default. Apply performs one targeted label update with readback; ambiguous or mixed stages stop without writing. Repository-wide migration and legacy label/list deletion are intentionally not automatic.
+
+### GitLab Issue Boards
+
+Self-hosted GitLab workflows can use a project Issue Board whose columns are backed by the same `workflow::*` labels:
+
+```sh
+issueflow --platform gitlab --repository group/repo board list
+issueflow --platform gitlab --repository group/repo board show 3
+issueflow --platform gitlab --repository group/repo board init-workflow
+```
+
+`board init-workflow` uses the default name `Issueflow Workflow`; override it with `--name`. It ensures all workflow labels, reuses a unique exact-name board or creates one, adds only missing label lists, orders the six canonical workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Legacy columns are reported as `legacy_lists` with `legacy_cleanup_required=true`; they are not silently deleted. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
 
 ### Dependencies
 
@@ -87,7 +108,7 @@ issueflow issue remove-dependency https://github.com/owner/repo/issues/42 https:
 
 The first issue is **blocked by the second issue**. Before adding a dependency, the CLI traverses reachable blockers and checks for cycles, up to 1,000 nodes. GitHub uses the dependencies API; GitLab uses issue links. Dependencies may cross repositories but must remain on the same platform and instance. Unsupported versions or insufficient permissions produce API errors; ordinary related-to links are never presented as blocking relationships. Native GitLab blocking relationships depend on the instance license.
 
-Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Native parent-child hierarchy APIs, GitLab MR operations, and worktree automation are outside this version's scope. Parent/child issue URLs and branch contracts can be maintained in issue bodies.
+Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent/child hierarchy is independent of blocking and does not automatically authorize work or delivery.
 
 ## GitHub Projects
 
@@ -170,14 +191,15 @@ HTTP-200 responses containing GraphQL errors are failures, even when partial dat
 
 Live validation against the configured personal Project passed metadata/options and item reads, existing membership reuse, invalid-option rejection, Status changes through Ready / In progress / In review, and matching-Status no-op behavior. The issue remained open. Creating a new Project membership has local test coverage but has not been exercised against a live account. Organization-owned Project URL parsing is tested; its GraphQL lookup has not been live-validated.
 
-## GitHub pull requests and branch delivery
+## Pull requests, merge requests, and branch delivery
 
-One issue can own a long-lived development branch with multiple commits. Git manages worktrees, branches, commits, and pushes; issueflow manages GitHub PRs. Branch names can use `feat/`, `fix/`, `refactor/`, `docs/`, or project conventions. A child issue's PR targets its parent integration branch, not necessarily `main`.
+One issue can own a long-lived development branch with multiple commits. Git manages worktrees, branches, commits, and pushes; issueflow manages GitHub PRs and same-project GitLab MRs. Branch names can use `feat/`, `fix/`, `refactor/`, `docs/`, or project conventions. A child issue's PR/MR targets its parent integration branch, not necessarily `main`.
 
 ```sh
 issueflow --platform github --repository owner/repo pr list --head feat/issue-5-example --base feat/issue-1-parent
 issueflow pr create https://github.com/owner/repo/issues/5 --file pr.json
 issueflow pr show https://github.com/owner/repo/pull/8
+issueflow pr show https://gitlab.example.com/group/repo/-/merge_requests/8
 ```
 
 Example `pr.json` (UTF-8; `--file -` also accepts stdin):
@@ -224,7 +246,20 @@ Merge requires an open, non-draft PR with the expected target and full head SHA.
 
 Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. GitHub closure and reopening are native-only by default; maintain Project fields separately. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
-Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+For GitLab, `pr list/show/create/update/ready/checks/merge` use the configured instance URL, nested project path, and MR iid. Creation is limited to source and target branches in the same project. `ready` removes a `Draft:` or `WIP:` title prefix. Checks return MR pipelines and the native approvals response as observed evidence; they never grant merge authorization. GitLab merge supports merge and squash, but not the GitHub-style rebase method. Protected branches, approval rules, pipeline requirements, and server policy remain authoritative.
+
+Current commands do not evaluate every repository merge policy. Review required checks using available repository evidence or the PR/MR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls), [GitLab Merge Requests API reference](https://docs.gitlab.com/api/merge_requests/).
+
+### Native parent and child hierarchy
+
+```sh
+issueflow hierarchy parent ISSUE_OR_WORK_ITEM_URL
+issueflow hierarchy children ISSUE_OR_WORK_ITEM_URL
+issueflow hierarchy add-child PARENT_URL CHILD_URL
+issueflow hierarchy remove-child PARENT_URL CHILD_URL
+```
+
+GitHub uses native Sub-issues REST endpoints. Adds traverse up to 1,000 descendants before writing to reject cycles, reuse an existing relationship, and read back mutations. GitLab uses the versionless Work Item GraphQL hierarchy widget through the configured instance `/api/graphql` endpoint. The project-level adapter supports the reliable `Issue -> Task` combination only: both items must be distinct and in the same project, their native Work Item types are read before mutation, an existing different parent causes a conflict, and `workItemUpdate.hierarchyWidget.parentId` is verified by rereading the child. Arbitrary `Issue -> Issue`, group Epic mapping, and hierarchy reordering are not claimed. Native hierarchy never implies a blocking dependency; keep branch contracts and blocking links explicit. [GitHub Sub-issues API](https://docs.github.com/en/rest/issues/sub-issues), [GitLab child items](https://docs.gitlab.com/user/work_items/child_items/).
 
 ### Validate parent/child branch contracts
 
@@ -258,7 +293,7 @@ issueflow --no-env-file workflow reconcile --file child.json --parent-file paren
 issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json --apply --expected-head-sha FULL_40_CHARACTER_SHA
 ```
 
-Both `inspect` and `reconcile` are **read-only by default**. They validate the branch contract and workflow configuration, resolve an explicit PR URL or search all PR states for the contracted head/base, verify the issue reference, and inspect native issue and Project state. Multiple matching historical PRs require an explicit `pr_url`; none is reported as `no_pr`, never treated as permission to create a new PR.
+Both `inspect` and `reconcile` are **read-only by default**. They validate the branch contract and workflow configuration, resolve an explicit PR/MR URL or search all states for the contracted head/base, verify the issue reference, and inspect native workflow state. GitHub reads required Project fields; GitLab reads its single workflow stage plus blocking/resolution labels. Multiple matching historical PRs/MRs require an explicit `pr_url`; none is reported as `no_pr`, never treated as permission to create one.
 
 A merged PR is considered delivered only when its merge commit is reachable from the contracted target according to GitHub's compare API. A missing/deleted target or unreadable evidence prevents automatic completion. Returned phases include `no_pr`, `in_progress`, `in_review`, `delivery_pending`, `acceptance_pending`, `manual_review`, `reconciliation_needed`, and `complete`.
 
@@ -310,7 +345,7 @@ issueflow workflow validate --file .issue-workflow.json
 
 These commands run offline before `.env` or environment configuration is loaded. `capabilities` derives its command/option tree from the installed CLI parser, so different builds can be distinguished even when their package versions match. It does not imply remote permissions.
 
-Workflow validation checks a GitHub-only, secret-free schema with `schema_version: 1`, `platform: "github"`, `host: "github.com"`, full `repository`, `remote`, `base_branch`, `timezone: "Asia/Shanghai"`, and explicit `permissions`. Optional fields include `proposer`, `verification_commands`, `manual_acceptance`, `delivery_condition`, `github_project_url`, and `branch_prefixes`. Unknown fields (including token fields) are rejected; configured commands are never executed. Validation neither changes API routing nor grants authorization. Existing API commands still use their normal explicit flags/environment configuration.
+Workflow validation checks a secret-free schema with `schema_version: 1`, `platform` set to `github` or `gitlab`, the exact host, full repository path, `remote`, `base_branch`, `timezone: "Asia/Shanghai"`, and explicit `permissions`. GitHub requires its normal Project setup before recovery can proceed; GitLab rejects `github_project_url` and uses labels. Unknown fields (including token fields) are rejected; configured commands are never executed. Runtime recovery also requires the workflow host to match the configured API host, and validation never grants authorization.
 
 `delivery_policy` is `merged` when approved merge into the contracted target completes delivery, or `acceptance_required` when deployment/device/business acceptance remains necessary. Omission defaults to `acceptance_required`. Both policies still require user merge approval. `permissions` retains independent local_commit/push flags and optional pull_request/draft_pr_mr flags; a legacy Draft permission is not promoted to general PR permission.
 
@@ -368,7 +403,7 @@ cargo clippy --all-targets -- -D warnings
 
 Automated tests cover configuration, credential redaction, URL handling, pagination, write mappings, duplicate detection, state changes, and dependency rules. Local HTTP servers verify both SDKs' authentication headers, base paths, JSON handling, empty `204` responses, redirects, and rate limiting. These tests do not write to real repositories.
 
-Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. Live validation against Jihu GitLab v18.4.6-jh is still pending.
+Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. Live validation of issue and MR operations against Jihu GitLab v18.4.6-jh is still pending.
 
 ### Native Project repository links
 

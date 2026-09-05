@@ -11,6 +11,22 @@ fn defaults_to_explicit_acceptance() {
         "acceptance_required"
     );
 }
+
+#[test]
+fn validates_secret_free_gitlab_workflow_without_github_project() {
+    let value = json!({
+        "schema_version":1,"platform":"gitlab","host":"gitlab.example.com",
+        "repository":"group/sub/repo","remote":"origin","base_branch":"main",
+        "timezone":"Asia/Shanghai","verification_commands":[],"manual_acceptance":[],
+        "delivery_condition":"Approved MR merged","delivery_policy":"merged",
+        "permissions":{"local_commit":true,"push":true,"pull_request":true},
+        "github_project_url":null,"branch_prefixes":{"feature":"feat"}
+    });
+    let workflow: WorkflowConfig = serde_json::from_value(value).unwrap();
+    let result = workflow.validate().unwrap();
+    assert_eq!(result["platform"], "gitlab");
+    assert_eq!(result["project"], Value::Null);
+}
 #[test]
 fn rejects_credentials_and_unknown_policy() {
     let mut v = sample();

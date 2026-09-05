@@ -30,6 +30,12 @@ struct Cli {
 enum Command {
     /// Inspect installed command capabilities without loading credentials
     Capabilities,
+    /// Read and maintain native parent/child relationships
+    #[command(subcommand)]
+    Hierarchy(HierarchyCommand),
+    /// Read and initialize GitLab project issue boards
+    #[command(subcommand)]
+    Board(BoardCommand),
     /// Validate a secret-free GitHub workflow configuration (offline)
     #[command(subcommand)]
     Workflow(WorkflowCommand),
@@ -48,6 +54,36 @@ enum Command {
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+}
+
+#[derive(Subcommand)]
+enum HierarchyCommand {
+    Parent {
+        issue_url: String,
+    },
+    Children {
+        issue_url: String,
+    },
+    AddChild {
+        parent_url: String,
+        child_url: String,
+    },
+    RemoveChild {
+        parent_url: String,
+        child_url: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BoardCommand {
+    List,
+    Show {
+        id: u64,
+    },
+    InitWorkflow {
+        #[arg(long, default_value = "Issueflow Workflow")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +288,12 @@ enum IssueCommand {
         #[arg(long)]
         request_id: String,
     },
+    /// Preview or apply canonical GitLab workflow metadata migration
+    ReconcileMetadata {
+        url: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// List all visible open and closed issues in the default repository
     List,
     /// Read an issue, optionally including all comments
@@ -306,7 +348,7 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// Reopen an issue; GitLab also restores triage labels
+    /// Reopen an issue; GitLab also restores the Backlog stage
     Reopen {
         url: String,
         #[arg(long)]
@@ -325,6 +367,7 @@ impl IssueCommand {
         match self {
             Self::List | Self::Create { .. } | Self::RecoverCreate { .. } => None,
             Self::Show { url, .. }
+            | Self::ReconcileMetadata { url, .. }
             | Self::Comments { url }
             | Self::Update { url, .. }
             | Self::Comment { url, .. }
@@ -369,6 +412,48 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
     }
+    if let Command::Hierarchy(command) = command {
+        let parent_url = match &command {
+            HierarchyCommand::Parent { issue_url } | HierarchyCommand::Children { issue_url } => {
+                issue_url
+            }
+            HierarchyCommand::AddChild { parent_url, .. }
+            | HierarchyCommand::RemoveChild { parent_url, .. } => parent_url,
+        };
+        let parent = issueflow::hierarchy::target_from_url(&config, parent_url)?;
+        let transport = SdkTransport::new(&config, parent.platform)?;
+        let hierarchy = issueflow::hierarchy::Hierarchy {
+            transport: &transport,
+            parent,
+        };
+        return match command {
+            HierarchyCommand::Parent { .. } => hierarchy.parent().await,
+            HierarchyCommand::Children { .. } => hierarchy.children().await,
+            HierarchyCommand::AddChild { child_url, .. } => {
+                hierarchy
+                    .add_child(&issueflow::hierarchy::target_from_url(&config, &child_url)?)
+                    .await
+            }
+            HierarchyCommand::RemoveChild { child_url, .. } => {
+                hierarchy
+                    .remove_child(&issueflow::hierarchy::target_from_url(&config, &child_url)?)
+                    .await
+            }
+        };
+    }
+    if let Command::Board(command) = command {
+        let target = Target::defaults(&config)?;
+        let transport = SdkTransport::new(&config, target.platform)?;
+        let boards = issueflow::board::Boards {
+            transport: &transport,
+            target,
+        };
+        return match command {
+            BoardCommand::List => boards.list().await,
+            BoardCommand::Show { id } => boards.show(id).await,
+            BoardCommand::InitWorkflow { name } => boards.init_workflow(&name).await,
+        };
+    }
     if let Command::Workflow(command) = command {
         let (args, apply, expected, cleanup) = match command {
             WorkflowCommand::Inspect(args) => (args, false, None, None),
@@ -398,7 +483,38 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         let workflow = input::<issueflow::workflow_config::WorkflowConfig>(&args.config_file)?;
         workflow.validate()?;
         contract.validate(parent.as_ref())?;
-        let transport = SdkTransport::new(&config, issueflow::config::Platform::Github)?;
+        let platform = workflow.platform()?;
+        match platform {
+            issueflow::config::Platform::Github
+                if workflow.host != "github.com"
+                    || config.github_api_url.as_str() != "https://api.github.com/" =>
+            {
+                return Err(Error::new(
+                    "configuration",
+                    "Workflow host does not match the configured GitHub API",
+                ));
+            }
+            issueflow::config::Platform::Gitlab => {
+                let host = config
+                    .gitlab_url
+                    .as_ref()
+                    .and_then(url::Url::host_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "configuration",
+                            "GitLab workflow requires --gitlab-url or ISSUEFLOW_GITLAB_URL",
+                        )
+                    })?;
+                if !host.eq_ignore_ascii_case(&workflow.host) {
+                    return Err(Error::new(
+                        "configuration",
+                        "Workflow host does not match the configured GitLab API",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let transport = SdkTransport::new(&config, platform)?;
         let recovery = issueflow::recovery::Recovery {
             config: &config,
             transport: &transport,
@@ -424,10 +540,8 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             | PullCommand::Ready { url, .. }
             | PullCommand::Checks { url } => target_from_url(&config, url)?,
         };
-        if target.platform != issueflow::config::Platform::Github {
-            return Err(Error::new("input", "PR commands support GitHub only"));
-        }
         if matches!(command, PullCommand::Ready { .. })
+            && target.platform == issueflow::config::Platform::Github
             && config.github_api_url.as_str() != "https://api.github.com/"
         {
             return Err(Error::new(
@@ -557,6 +671,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         Command::Issue(command) => match command {
             IssueCommand::List => service.list().await,
             IssueCommand::RecoverCreate { request_id } => service.recover_create(&request_id).await,
+            IssueCommand::ReconcileMetadata { apply, .. } => {
+                service.reconcile_metadata(apply).await
+            }
             IssueCommand::Show { comments, .. } => {
                 let issue = service.show().await?;
                 if comments {

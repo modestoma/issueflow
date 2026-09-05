@@ -52,6 +52,12 @@ impl SdkTransport {
                         .ok_or_else(|| Error::new("configuration", "缺少 ISSUEFLOW_GITLAB_URL"))?
                         .join("api/v4/")
                         .map_err(|_| Error::new("configuration", "GitLab 地址无效"))?;
+                    let graphql = config
+                        .gitlab_url
+                        .as_ref()
+                        .ok_or_else(|| Error::new("configuration", "缺少 ISSUEFLOW_GITLAB_URL"))?
+                        .join("api/graphql")
+                        .map_err(|_| Error::new("configuration", "GitLab GraphQL 地址无效"))?;
                     let client = reqwest::Client::builder()
                         .redirect(reqwest::redirect::Policy::none())
                         .timeout(timeout)
@@ -60,6 +66,7 @@ impl SdkTransport {
                         .map_err(|_| Error::new("configuration", "无法初始化 HTTP 客户端"))?;
                     Backend::Gitlab(GitlabHttp {
                         base,
+                        graphql,
                         client,
                         token: token.expose().to_string(),
                     })
@@ -162,13 +169,18 @@ impl Endpoint for JsonEndpoint {
 // redirects and supporting an instance base path, without an implicit auth probe.
 struct GitlabHttp {
     base: Url,
+    graphql: Url,
     client: reqwest::Client,
     token: String,
 }
 impl RestClient for GitlabHttp {
     type Error = std::io::Error;
     fn rest_endpoint(&self, endpoint: &str) -> std::result::Result<Url, ApiError<Self::Error>> {
-        Ok(self.base.join(endpoint)?)
+        if endpoint == "graphql" {
+            Ok(self.graphql.clone())
+        } else {
+            Ok(self.base.join(endpoint)?)
+        }
     }
 }
 #[async_trait]
@@ -181,7 +193,9 @@ impl AsyncClient for GitlabHttp {
         let fail = || ApiError::client(std::io::Error::other("HTTP transport failed"));
         let request = request.body(body).map_err(|_| fail())?;
         let url = Url::parse(&request.uri().to_string()).map_err(|_| fail())?;
-        if url.origin() != self.base.origin() || !url.path().starts_with(self.base.path()) {
+        if url.origin() != self.base.origin()
+            || !(url.path().starts_with(self.base.path()) || url.path() == self.graphql.path())
+        {
             return Err(fail());
         }
         let (parts, body) = request.into_parts();
