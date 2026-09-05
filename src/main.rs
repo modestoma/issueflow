@@ -47,6 +47,18 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PullCommand {
+    Update {
+        url: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_head_sha: String,
+    },
+    Ready {
+        url: String,
+        #[arg(long)]
+        expected_head_sha: String,
+    },
     List {
         #[arg(long)]
         head: Option<String>,
@@ -213,12 +225,21 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         let target = match &command {
             PullCommand::List { .. } => Target::defaults(&config)?,
             PullCommand::Create { issue_url, .. } => Target::from_url(&config, issue_url)?,
-            PullCommand::Show { url } | PullCommand::Merge { url, .. } => {
-                target_from_url(&config, url)?
-            }
+            PullCommand::Show { url }
+            | PullCommand::Merge { url, .. }
+            | PullCommand::Update { url, .. }
+            | PullCommand::Ready { url, .. } => target_from_url(&config, url)?,
         };
         if target.platform != issueflow::config::Platform::Github {
             return Err(Error::new("input", "PR commands support GitHub only"));
+        }
+        if matches!(command, PullCommand::Ready { .. })
+            && config.github_api_url.as_str() != "https://api.github.com/"
+        {
+            return Err(Error::new(
+                "configuration",
+                "PR ready currently supports github.com only",
+            ));
         }
         let transport = SdkTransport::new(&config, target.platform)?;
         let service = Pulls {
@@ -230,6 +251,14 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 service.list(head.as_deref(), base.as_deref()).await
             }
             PullCommand::Show { .. } => service.show().await,
+            PullCommand::Update {
+                file,
+                expected_head_sha,
+                ..
+            } => service.update(input(&file)?, &expected_head_sha).await,
+            PullCommand::Ready {
+                expected_head_sha, ..
+            } => service.ready(&expected_head_sha).await,
             PullCommand::Create { issue_url, file } => {
                 service.create(input(&file)?, &issue_url).await
             }

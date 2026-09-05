@@ -163,6 +163,15 @@ Push the head branch first. Head and base must be distinct branches in the same 
 
 `pr list` returns open PRs with complete pagination. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
 
+Update a PR selectively or mark a Draft ready for review:
+
+```sh
+issueflow pr update https://github.com/owner/repo/pull/8 --file pr-changes.json --expected-head-sha FULL_40_CHARACTER_SHA
+issueflow pr ready https://github.com/owner/repo/pull/8 --expected-head-sha FULL_40_CHARACTER_SHA
+```
+
+Update JSON accepts only optional `title` and `body`. Omitted/null fields are preserved, blank titles and empty updates are rejected, and existing standalone `Refs https://...` lines are retained when replacing the body. No base/head retargeting is performed. Both operations reject closed PRs or stale head expectations and read back their results. This is a read-before-write check, not an atomic lock; concurrent metadata edits may still race. `ready` is a no-op if already ready and currently supports github.com only. Neither command merges or closes issues; GraphQL mutation errors may have unknown outcomes.
+
 After explicit review and merge authorization:
 
 ```sh
@@ -174,7 +183,7 @@ Merge requires an open, non-draft PR with the expected target and full head SHA.
 
 Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. Project-backed closure uses `--no-workflow-labels`; reopening has the same flag. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
-Current commands do not edit PR metadata, read all review/check-run details, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+Current commands do not read all review/check-run details, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
 
 ## Output and errors
 
