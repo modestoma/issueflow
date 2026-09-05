@@ -59,7 +59,7 @@ fn github(t: &Target) -> Result<()> {
         Ok(())
     }
 }
-fn branch(s: &str) -> Result<()> {
+pub(crate) fn branch(s: &str) -> Result<()> {
     if s.is_empty()
         || s == "@"
         || s.starts_with('-')
