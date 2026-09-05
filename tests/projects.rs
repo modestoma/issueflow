@@ -639,3 +639,147 @@ async fn clear_field_verifies_unset_value() {
             .contains("clearProjectV2ItemFieldValue")
     );
 }
+
+fn repository() -> Value {
+    json!({"id":"R1","nameWithOwner":"modestoma/issueflow","url":"https://github.com/modestoma/issueflow"})
+}
+fn repository_lookup() -> Value {
+    json!({"data":{"repository":repository()}})
+}
+#[tokio::test]
+async fn repository_link_writes_once_and_verifies() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        repository_lookup(),
+        page("repositories", json!([]), false, Value::Null),
+        json!({"data":{"linkProjectV2ToRepository":{"repository":{"id":"R1"}}}}),
+        page("repositories", json!([repository()]), false, Value::Null),
+    ]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .link_repository("modestoma/issueflow")
+    .await
+    .unwrap();
+    assert_eq!(v["changed"], true);
+    let calls = m.calls.lock().unwrap();
+    let writes: Vec<_> = calls
+        .iter()
+        .filter(|v| v["query"].as_str().unwrap().starts_with("mutation"))
+        .collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0]["variables"],
+        json!({"project":"P1","repository":"R1"})
+    );
+    assert!(m.replies.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn existing_repository_link_on_later_page_is_reused() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        repository_lookup(),
+        page(
+            "repositories",
+            json!([{"id":"R2","nameWithOwner":"modestoma/other","url":"https://github.com/modestoma/other"}]),
+            true,
+            json!("next"),
+        ),
+        page("repositories", json!([repository()]), false, Value::Null),
+    ]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .link_repository("modestoma/issueflow")
+    .await
+    .unwrap();
+    assert_eq!(v["changed"], false);
+    assert!(
+        m.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v["query"].as_str().unwrap().starts_with("query"))
+    );
+}
+#[tokio::test]
+async fn invalid_or_redirected_repository_never_mutates() {
+    let m = Mock::new(vec![]);
+    let p = Projects {
+        transport: &m,
+        target: project(),
+    };
+    assert!(p.link_repository("https://github.com/a/b").await.is_err());
+    assert!(m.calls.lock().unwrap().is_empty());
+    let m = Mock::new(vec![meta(), fields(), repository_lookup()]);
+    let err = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .link_repository("modestoma/renamed")
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "conflict");
+}
+#[tokio::test]
+async fn failed_repository_link_readback_is_unknown() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        repository_lookup(),
+        page("repositories", json!([]), false, Value::Null),
+        json!({"data":{"linkProjectV2ToRepository":{"repository":{"id":"R1"}}}}),
+        page("repositories", json!([]), false, Value::Null),
+    ]);
+    let err = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .link_repository("modestoma/issueflow")
+    .await
+    .unwrap_err();
+    assert!(err.outcome_unknown);
+}
+#[tokio::test]
+async fn repository_link_permission_failure_is_not_retried() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        repository_lookup(),
+        page("repositories", json!([]), false, Value::Null),
+        json!({"errors":[{"type":"FORBIDDEN","message":"secret"}]}),
+    ]);
+    let err = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .link_repository("modestoma/issueflow")
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "permission");
+    assert!(err.outcome_unknown);
+    assert!(!err.message.contains("secret"));
+    assert!(m.replies.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn repository_pagination_rejects_repeated_cursor() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        page("repositories", json!([]), true, json!("same")),
+        page("repositories", json!([]), true, json!("same")),
+    ]);
+    assert!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .repositories()
+        .await
+        .is_err()
+    );
+}
