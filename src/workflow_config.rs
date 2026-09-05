@@ -93,9 +93,6 @@ impl WorkflowConfig {
                 return Err(invalid());
             }
         }
-        if platform == Platform::Github && self.github_project_url.is_none() {
-            return Err(invalid());
-        }
         if let Some(url) = &self.github_project_url {
             let cfg = Config::resolve(HashMap::new(), HashMap::new(), Overrides::default())
                 .map_err(Error::from)?;
