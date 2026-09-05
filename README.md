@@ -2,7 +2,7 @@
 
 A Rust CLI for managing GitHub and GitLab issues. It accesses platform APIs directly through SDKs, without requiring `gh`, `glab`, or Python.
 
-Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; and managing native blocking dependencies. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
+Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; managing native blocking dependencies; and delivering GitHub pull requests or same-project GitLab merge requests. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
 
 ## Build and usage
 
@@ -87,7 +87,7 @@ issueflow issue remove-dependency https://github.com/owner/repo/issues/42 https:
 
 The first issue is **blocked by the second issue**. Before adding a dependency, the CLI traverses reachable blockers and checks for cycles, up to 1,000 nodes. GitHub uses the dependencies API; GitLab uses issue links. Dependencies may cross repositories but must remain on the same platform and instance. Unsupported versions or insufficient permissions produce API errors; ordinary related-to links are never presented as blocking relationships. Native GitLab blocking relationships depend on the instance license.
 
-Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Native parent-child hierarchy APIs, GitLab MR operations, and worktree automation are outside this version's scope. Parent/child issue URLs and branch contracts can be maintained in issue bodies.
+Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Native parent-child hierarchy APIs and worktree automation are outside this version's scope. Parent/child issue URLs and branch contracts can be maintained in issue bodies.
 
 ## GitHub Projects
 
@@ -170,14 +170,15 @@ HTTP-200 responses containing GraphQL errors are failures, even when partial dat
 
 Live validation against the configured personal Project passed metadata/options and item reads, existing membership reuse, invalid-option rejection, Status changes through Ready / In progress / In review, and matching-Status no-op behavior. The issue remained open. Creating a new Project membership has local test coverage but has not been exercised against a live account. Organization-owned Project URL parsing is tested; its GraphQL lookup has not been live-validated.
 
-## GitHub pull requests and branch delivery
+## Pull requests, merge requests, and branch delivery
 
-One issue can own a long-lived development branch with multiple commits. Git manages worktrees, branches, commits, and pushes; issueflow manages GitHub PRs. Branch names can use `feat/`, `fix/`, `refactor/`, `docs/`, or project conventions. A child issue's PR targets its parent integration branch, not necessarily `main`.
+One issue can own a long-lived development branch with multiple commits. Git manages worktrees, branches, commits, and pushes; issueflow manages GitHub PRs and same-project GitLab MRs. Branch names can use `feat/`, `fix/`, `refactor/`, `docs/`, or project conventions. A child issue's PR/MR targets its parent integration branch, not necessarily `main`.
 
 ```sh
 issueflow --platform github --repository owner/repo pr list --head feat/issue-5-example --base feat/issue-1-parent
 issueflow pr create https://github.com/owner/repo/issues/5 --file pr.json
 issueflow pr show https://github.com/owner/repo/pull/8
+issueflow pr show https://gitlab.example.com/group/repo/-/merge_requests/8
 ```
 
 Example `pr.json` (UTF-8; `--file -` also accepts stdin):
@@ -224,7 +225,9 @@ Merge requires an open, non-draft PR with the expected target and full head SHA.
 
 Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. GitHub closure and reopening are native-only by default; maintain Project fields separately. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
-Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+For GitLab, `pr list/show/create/update/ready/checks/merge` use the configured instance URL, nested project path, and MR iid. Creation is limited to source and target branches in the same project. `ready` removes a `Draft:` or `WIP:` title prefix. Checks return MR pipelines and the native approvals response as observed evidence; they never grant merge authorization. GitLab merge supports merge and squash, but not the GitHub-style rebase method. Protected branches, approval rules, pipeline requirements, and server policy remain authoritative.
+
+Current commands do not evaluate every repository merge policy or manage native sub-issue relationships. Review required checks using available repository evidence or the PR/MR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls), [GitLab Merge Requests API reference](https://docs.gitlab.com/api/merge_requests/).
 
 ### Validate parent/child branch contracts
 
@@ -368,7 +371,7 @@ cargo clippy --all-targets -- -D warnings
 
 Automated tests cover configuration, credential redaction, URL handling, pagination, write mappings, duplicate detection, state changes, and dependency rules. Local HTTP servers verify both SDKs' authentication headers, base paths, JSON handling, empty `204` responses, redirects, and rate limiting. These tests do not write to real repositories.
 
-Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. Live validation against Jihu GitLab v18.4.6-jh is still pending.
+Live GitHub validation passed the main issue maintenance operations but reproduced duplicate creation when immediately retrying the same request ID. Live validation of issue and MR operations against Jihu GitLab v18.4.6-jh is still pending.
 
 ### Native Project repository links
 

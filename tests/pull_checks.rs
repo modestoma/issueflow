@@ -122,3 +122,41 @@ async fn unrelated_repository_metadata_does_not_invalidate_evidence() {
     .unwrap();
     assert_eq!(v["observed_checks"], "absent");
 }
+
+#[tokio::test]
+async fn gitlab_reports_pipeline_and_approval_evidence_without_authorizing_merge() {
+    let mr = json!({
+        "iid":9,
+        "state":"opened",
+        "draft":false,
+        "sha":"a".repeat(40),
+        "diff_refs":{"head_sha":"a".repeat(40)},
+        "source_branch":"feat/change",
+        "target_branch":"main",
+        "source_project_id":4,
+        "target_project_id":4
+    });
+    let approvals = json!({"approvals_required":1,"approvals_left":0,"approved_by":[{"user":{"username":"reviewer"}}]});
+    let m = Mock(Mutex::new(
+        vec![
+            mr.clone(),
+            json!([{"id":2,"status":"success","sha":"a".repeat(40)}]),
+            approvals.clone(),
+            mr,
+        ]
+        .into(),
+    ));
+    let v = inspect(
+        &m,
+        Target {
+            platform: Platform::Gitlab,
+            repository: "group/sub/repo".into(),
+            number: Some(9),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["observed_checks"], "passed");
+    assert_eq!(v["approvals"], approvals);
+    assert_eq!(v["merge_authorized"], false);
+}
