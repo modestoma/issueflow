@@ -93,6 +93,50 @@ The first issue is **blocked by the second issue**. Before adding a dependency, 
 
 Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent-child hierarchies, fallback dependencies in issue bodies, PR/MR operations, and worktree automation are outside this version's scope.
 
+## GitHub Projects
+
+Projects v2 commands support user-owned and organization-owned projects on **github.com**. GitHub Enterprise Projects routing is not supported in this version; custom GitHub API bases are rejected by these commands. Existing issue commands retain their previous platform support.
+
+Use a canonical Project URL, not a board view URL with `/views/N` or query parameters:
+
+```sh
+issueflow --no-env-file project show https://github.com/users/modestoma/projects/1
+issueflow --no-env-file project items https://github.com/users/modestoma/projects/1
+issueflow --no-env-file project add https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4
+issueflow --no-env-file project status https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4
+issueflow --no-env-file project status https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4 --to 'In progress'
+```
+
+For organization projects, use `https://github.com/orgs/OWNER/projects/N`. Project and issue URLs are explicit; these commands do not require default platform/repository configuration. They use `ISSUEFLOW_GITHUB_TOKEN` and the same configuration precedence as other commands. `--no-env-file` ensures authentication comes from the process environment.
+
+`show` returns metadata and field definitions, including Status option names and IDs. `items` lists all visible Project items with their Status, including draft issues and pull requests; hidden content may be null. Fields and items use cursor pagination, with repeated IDs/cursors and incomplete results treated as errors. The limit is 1,000 pages per connection.
+
+`add` accepts an existing GitHub issue, checks membership, and reuses an existing item. `status` without `--to` reads its current Status. With `--to`, it resolves an exact, case-sensitive option name from the single-select field named `Status`. Missing or ambiguous fields/options are rejected. The issue must already belong to the Project; setting Status does not implicitly add it. Archived items cannot have Status changed through this command. Mutations are read back, and already-matching Status values do not trigger another mutation.
+
+For a board using these stages, the recommended workflow mapping is:
+
+| Workflow meaning | Project Status |
+| --- | --- |
+| Captured, being reviewed, or awaiting clarification | Backlog |
+| Clarified and ready to start, with prerequisites available | Ready |
+| Implementation and verification in progress | In progress |
+| Awaiting review or human acceptance | In review |
+| Accepted and delivered | Done |
+
+Use an independently configured option such as `Cancelled` for termination, if available; do not interpret every closed issue as Done. The CLI does not create fields or options. Keep type, priority, and blocked labels independently.
+
+Projects-backed GitHub workflows should use `project status` as the stage store instead of calling the label-based `issue transition`. Existing `issue transition`, `issue close`, and `issue reopen` still maintain workflow labels; they have not been converted to Project-aware operations. Do not use both mechanisms to mirror stages. Project-aware native issue closure is outside these commands' scope.
+
+**Project Status and issue state are separate.** The CLI does not send issue-close mutations when changing Status. However, GitHub Project automations can close issues or overwrite Status when items change. Inspect the Project's Workflows settings before using live status writes; disable automatic closure if it would bypass human acceptance. Moving a card does not launch Codex or authorize merging or deployment.
+
+### Projects authentication and failure handling
+
+Issue write permissions alone are insufficient for Projects. For personal Projects, GitHub's GraphQL guide documents classic PAT scopes `read:project` for queries or `project` for queries and mutations. Retain the repository access needed for the issues being added (including `repo` for private repositories when using a classic PAT). An organization may instead use an appropriately authorized GitHub App. See [GitHub's Projects API guide](https://docs.github.com/en/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects) for token support and permissions. Tokens belong in the environment or private configuration files, never command arguments.
+
+HTTP-200 responses containing GraphQL errors are failures, even when partial data is present. Known insufficient-scope/forbidden errors return the permission exit code; raw error messages are not printed. Queries use POST but are classified as read-only for unknown-outcome reporting. Failed mutations or failed readback can report `outcome_unknown: true`; inspect Project items/Status before another write. There are no automatic mutation retries, background synchronization, or cross-user transactions.
+
+Live validation against the configured personal Project passed metadata/options and item reads, existing membership reuse, invalid-option rejection, Status changes through Ready / In progress / In review, and matching-Status no-op behavior. The issue remained open. Creating a new Project membership has local test coverage but has not been exercised against a live account. Organization-owned Project URL parsing is tested; its GraphQL lookup has not been live-validated.
+
 ## Output and errors
 
 Successful commands write JSON to stdout; errors write JSON to stderr. Normalized issue results contain `platform`, `id`, `number`, `url`, `title`, `body`, `state`, `labels`, `created_at`, and `updated_at`. `id` is the platform-wide ID; `number` is the repository's native issue number (GitLab `iid`). Comments and dependencies retain platform-native JSON.

@@ -28,6 +28,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Read and manage GitHub Projects v2
+    #[command(subcommand)]
+    Project(ProjectCommand),
     /// Show effective configuration as JSON; credentials are never included
     Config,
     /// Check API authentication for the configured platform (read-only)
@@ -37,6 +40,23 @@ enum Command {
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Read Project metadata and field options
+    Show { url: String },
+    /// List all visible Project items and their Status
+    Items { url: String },
+    /// Add an existing issue, reusing existing membership
+    Add { url: String, issue_url: String },
+    /// Read Status, or set an exact option name (does not itself close issues)
+    Status {
+        url: String,
+        issue_url: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -150,6 +170,39 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         return Ok(
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
+    }
+    if let Command::Project(command) = command {
+        use issueflow::project::{ProjectTarget, Projects};
+        let url = match &command {
+            ProjectCommand::Show { url }
+            | ProjectCommand::Items { url }
+            | ProjectCommand::Add { url, .. }
+            | ProjectCommand::Status { url, .. } => url,
+        };
+        let target = ProjectTarget::parse(&config, url)?;
+        let issue = match &command {
+            ProjectCommand::Add { issue_url, .. } | ProjectCommand::Status { issue_url, .. } => {
+                let t = Target::from_url(&config, issue_url)?;
+                if t.platform != issueflow::config::Platform::Github {
+                    return Err(Error::new("input", "Projects requires a GitHub issue"));
+                }
+                Some(t)
+            }
+            _ => None,
+        };
+        let transport = SdkTransport::new(&config, issueflow::config::Platform::Github)?;
+        let service = Projects {
+            transport: &transport,
+            target,
+        };
+        return match command {
+            ProjectCommand::Show { .. } => service.show().await,
+            ProjectCommand::Items { .. } => service.items().await,
+            ProjectCommand::Add { .. } => service.add(issue.as_ref().unwrap()).await,
+            ProjectCommand::Status { to, .. } => {
+                service.status(issue.as_ref().unwrap(), to.as_deref()).await
+            }
+        };
     }
     let target = match &command {
         Command::Issue(issue) => match issue.url() {

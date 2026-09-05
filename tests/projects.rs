@@ -1,0 +1,375 @@
+use async_trait::async_trait;
+use http::Method;
+use issueflow::{
+    config::{Config, Overrides},
+    error::{Error, Result},
+    project::{ProjectTarget, Projects},
+    target::Target,
+    transport::Transport,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+};
+struct Mock {
+    replies: Mutex<VecDeque<Value>>,
+    calls: Mutex<Vec<Value>>,
+}
+impl Mock {
+    fn new(v: Vec<Value>) -> Self {
+        Self {
+            replies: Mutex::new(v.into()),
+            calls: Mutex::new(vec![]),
+        }
+    }
+}
+#[async_trait]
+impl Transport for Mock {
+    async fn request(&self, method: Method, endpoint: &str, body: Option<Value>) -> Result<Value> {
+        assert_eq!(method, Method::POST);
+        assert_eq!(endpoint, "graphql");
+        self.calls.lock().unwrap().push(body.unwrap());
+        Ok(self
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected call"))
+    }
+}
+fn config() -> Config {
+    Config::resolve(HashMap::new(), HashMap::new(), Overrides::default()).unwrap()
+}
+fn project() -> ProjectTarget {
+    ProjectTarget::parse(&config(), "https://github.com/users/modestoma/projects/1").unwrap()
+}
+fn issue() -> Target {
+    Target::from_url(&config(), "https://github.com/modestoma/issueflow/issues/4").unwrap()
+}
+fn meta() -> Value {
+    json!({"data":{"owner":{"projectV2":{"id":"P1","title":"Board","url":"https://github.com/users/modestoma/projects/1","closed":false}}}})
+}
+fn page(field: &str, nodes: Value, next: bool, cursor: Value) -> Value {
+    json!({"data":{"node":{field:{"nodes":nodes,"pageInfo":{"hasNextPage":next,"endCursor":cursor}}}}})
+}
+fn fields() -> Value {
+    page(
+        "fields",
+        json!([{"id":"F1","name":"Status","options":[{"id":"O1","name":"Ready"},{"id":"O2","name":"Done"}]}]),
+        false,
+        Value::Null,
+    )
+}
+fn id() -> Value {
+    json!({"data":{"repository":{"issue":{"id":"I1"}}}})
+}
+fn item(option: &str) -> Value {
+    json!({"id":"ITEM1","isArchived":false,"content":{"id":"I1","__typename":"Issue"},"fieldValueByName":{"optionId":option}})
+}
+#[test]
+fn validates_project_urls() {
+    for url in [
+        "https://evil.test/users/a/projects/1",
+        "https://user:secret@github.com/users/a/projects/1",
+        "https://github.com/users/a/projects/0",
+        "https://github.com/users/a/projects/1?x=y",
+        "https://github.com/users/a/projects/1/views/2",
+    ] {
+        assert!(ProjectTarget::parse(&config(), url).is_err());
+    }
+    assert_eq!(
+        ProjectTarget::parse(&config(), "https://github.com/orgs/example/projects/2")
+            .unwrap()
+            .kind,
+        "organization"
+    );
+}
+#[tokio::test]
+async fn paginates_fields_and_items() {
+    let m = Mock::new(vec![
+        meta(),
+        page(
+            "fields",
+            json!([{"id":"other","name":"Text"}]),
+            true,
+            json!("F-next"),
+        ),
+        fields(),
+        page("items", json!([{"id":"a"}]), true, json!("I-next")),
+        page("items", json!([{"id":"b"}]), false, Value::Null),
+    ]);
+    let p = Projects {
+        transport: &m,
+        target: project(),
+    };
+    let v = p.items().await.unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    let c = m.calls.lock().unwrap();
+    assert_eq!(c[2]["variables"]["after"], "F-next");
+    assert_eq!(c[4]["variables"]["after"], "I-next");
+}
+#[tokio::test]
+async fn rejects_partial_graphql_data() {
+    let m = Mock::new(vec![
+        json!({"data":{"owner":{}},"errors":[{"message":"SECRET"}]}),
+    ]);
+    let e = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .show()
+    .await
+    .unwrap_err();
+    assert!(!e.outcome_unknown);
+    assert!(!e.message.contains("SECRET"));
+}
+#[tokio::test]
+async fn reuse_membership_does_not_mutate() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([item("O1")]), false, Value::Null),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .add(&issue())
+        .await
+        .unwrap()["reused"],
+        true
+    );
+    assert!(
+        m.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c["query"].as_str().unwrap().starts_with("query"))
+    );
+}
+#[tokio::test]
+async fn unknown_option_stops_before_mutation() {
+    let m = Mock::new(vec![meta(), fields()]);
+    assert!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .status(&issue(), Some("In Progress"))
+        .await
+        .is_err()
+    );
+    assert_eq!(m.calls.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn status_uses_ids_and_reads_back() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([item("O1")]), false, Value::Null),
+        json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM1"}}}}),
+        page("items", json!([item("O2")]), false, Value::Null),
+    ]);
+    let v = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .status(&issue(), Some("Done"))
+    .await
+    .unwrap();
+    assert_eq!(v["changed"], true);
+    let calls = m.calls.lock().unwrap();
+    assert_eq!(
+        calls[4]["variables"],
+        json!({"project":"P1","item":"ITEM1","field":"F1","option":"O2"})
+    );
+    assert!(!calls[4]["query"].as_str().unwrap().contains("closeIssue"));
+}
+#[tokio::test]
+async fn mutation_errors_have_unknown_outcome() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([]), false, Value::Null),
+        json!({"data":null,"errors":[{"message":"PRIVATE"}]}),
+    ]);
+    let e = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .add(&issue())
+    .await
+    .unwrap_err();
+    assert!(e.outcome_unknown);
+    assert!(!e.message.contains("PRIVATE"));
+}
+#[tokio::test]
+async fn repeated_cursor_is_not_partial_success() {
+    let m = Mock::new(vec![
+        meta(),
+        page("fields", json!([{"id":"1"}]), true, json!("same")),
+        page("fields", json!([{"id":"2"}]), true, json!("same")),
+    ]);
+    assert!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .show()
+        .await
+        .is_err()
+    );
+}
+struct Offline;
+#[async_trait]
+impl Transport for Offline {
+    async fn request(&self, _: Method, _: &str, _: Option<Value>) -> Result<Value> {
+        Err(Error::network(true))
+    }
+}
+#[tokio::test]
+async fn read_timeout_does_not_claim_unknown_write() {
+    assert!(
+        !Projects {
+            transport: &Offline,
+            target: project()
+        }
+        .show()
+        .await
+        .unwrap_err()
+        .outcome_unknown
+    );
+}
+
+#[tokio::test]
+async fn missing_membership_is_not_implicitly_added() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([]), false, Value::Null),
+    ]);
+    let e = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .status(&issue(), Some("Ready"))
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, "not_found");
+    assert!(
+        m.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c["query"].as_str().unwrap().starts_with("query"))
+    );
+}
+#[tokio::test]
+async fn matching_status_is_a_noop() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([item("O1")]), false, Value::Null),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .status(&issue(), Some("Ready"))
+        .await
+        .unwrap()["changed"],
+        false
+    );
+    assert_eq!(m.calls.lock().unwrap().len(), 4);
+}
+#[tokio::test]
+async fn mismatched_readback_reports_possible_write() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([item("O1")]), false, Value::Null),
+        json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM1"}}}}),
+        page("items", json!([item("O1")]), false, Value::Null),
+    ]);
+    let e = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .status(&issue(), Some("Done"))
+    .await
+    .unwrap_err();
+    assert!(e.outcome_unknown);
+    assert_eq!(e.code, "conflict");
+}
+#[tokio::test]
+async fn adds_once_and_confirms_membership() {
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([]), false, Value::Null),
+        json!({"data":{"addProjectV2ItemById":{"item":{"id":"ITEM1"}}}}),
+        page("items", json!([item("O1")]), false, Value::Null),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .add(&issue())
+        .await
+        .unwrap()["reused"],
+        false
+    );
+    assert_eq!(
+        m.calls.lock().unwrap()[4]["variables"],
+        json!({"project":"P1","content":"I1"})
+    );
+}
+#[tokio::test]
+async fn permission_errors_are_actionable_and_redacted() {
+    let m = Mock::new(vec![
+        json!({"errors":[{"type":"INSUFFICIENT_SCOPES","message":"SECRET"}]}),
+    ]);
+    let e = Projects {
+        transport: &m,
+        target: project(),
+    }
+    .show()
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, "permission");
+    assert_eq!(e.exit_code(), 3);
+    assert!(!e.message.contains("SECRET"));
+}
+#[tokio::test]
+async fn archived_status_writes_are_rejected() {
+    let mut archived = item("O1");
+    archived["isArchived"] = json!(true);
+    let m = Mock::new(vec![
+        meta(),
+        fields(),
+        id(),
+        page("items", json!([archived]), false, Value::Null),
+    ]);
+    assert_eq!(
+        Projects {
+            transport: &m,
+            target: project()
+        }
+        .status(&issue(), Some("Done"))
+        .await
+        .unwrap_err()
+        .code,
+        "input"
+    );
+}

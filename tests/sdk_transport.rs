@@ -160,3 +160,42 @@ async fn rate_limits_are_structured_without_retries() {
         server.join().unwrap();
     }
 }
+
+#[tokio::test]
+async fn projects_use_sdk_graphql_post_and_classify_permission_errors() {
+    use issueflow::project::{ProjectTarget, Projects};
+    let (address, server) = server(
+        200,
+        r#"{"errors":[{"type":"INSUFFICIENT_SCOPES","message":"sdk-test-secret"}]}"#,
+        "",
+    );
+    let mut cfg = config(Platform::Github, &address);
+    cfg.github_api_url = format!("{address}/").parse().unwrap();
+    let transport = SdkTransport::new(&cfg, Platform::Github).unwrap();
+    let projects = Projects {
+        transport: &transport,
+        target: ProjectTarget {
+            owner: "test-owner".into(),
+            kind: "user",
+            number: 1,
+        },
+    };
+    let error = projects.show().await.unwrap_err();
+    assert_eq!(error.code, "permission");
+    assert!(!error.outcome_unknown);
+    assert!(!error.message.contains("sdk-test-secret"));
+    let request = server.join().unwrap();
+    assert!(request.starts_with("POST /graphql "));
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        payload["variables"],
+        json!({"owner":"test-owner","number":1})
+    );
+    assert!(
+        payload["query"]
+            .as_str()
+            .unwrap()
+            .contains("owner:user(login:$owner)")
+    );
+}
