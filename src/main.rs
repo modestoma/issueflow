@@ -327,7 +327,7 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// Reopen an issue; GitLab also restores triage labels
+    /// Reopen an issue; GitLab also restores the Backlog stage
     Reopen {
         url: String,
         #[arg(long)]

@@ -559,6 +559,57 @@ async fn gitlab_metadata_migration_previews_canonical_stage_resolution_and_block
 }
 
 #[tokio::test]
+async fn gitlab_metadata_migration_applies_once_and_clears_stale_blocked() {
+    let current = issue(
+        Platform::Gitlab,
+        &[
+            "workflow::待验收",
+            "blocked",
+            "type::feature",
+            "priority::P1",
+        ],
+    );
+    let migrated = issue(
+        Platform::Gitlab,
+        &["workflow::In review", "type::feature", "priority::P1"],
+    );
+    let endpoint = "projects/group%2Fsub%2Frepo/issues/2";
+    let mock = Mock::new(vec![
+        step(Method::GET, endpoint, None, current.clone()),
+        step(Method::GET, endpoint, None, current.clone()),
+        step(
+            Method::GET,
+            "projects/group%2Fsub%2Frepo/issues/2/links?per_page=100&page=1",
+            None,
+            json!([]),
+        ),
+        step(Method::GET, endpoint, None, current),
+        step(
+            Method::PUT,
+            endpoint,
+            Some(json!({
+                "add_labels":"workflow::In review",
+                "remove_labels":"blocked,workflow::待验收"
+            })),
+            json!({}),
+        ),
+        step(Method::GET, endpoint, None, migrated),
+    ]);
+    let result = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .reconcile_metadata(true)
+    .await
+    .unwrap();
+    assert_eq!(result["applied"], true);
+    assert_eq!(
+        result["issue"]["labels"],
+        json!(["workflow::In review", "type::feature", "priority::P1"])
+    );
+}
+
+#[tokio::test]
 async fn unknown_input_fields_and_empty_edits_are_rejected() {
     assert!(serde_json::from_value::<CreateInput>(json!({"title":"test","typo":"bad"})).is_err());
     let mock = Mock::new(vec![]);

@@ -1,7 +1,7 @@
 use crate::{
     config::Platform,
     error::{Error, Result},
-    service::{Service, WORKFLOW_STAGE_LABELS},
+    service::{LEGACY_WORKFLOW_STAGE_LABELS, Service, WORKFLOW_STAGE_LABELS},
     target::{Target, encode},
     transport::Transport,
 };
@@ -190,9 +190,23 @@ impl Boards<'_> {
                 )));
             }
         }
-        Ok(
-            json!({"changed":changed,"board":final_board,"workflow_lists":final_lists.into_iter().filter(|list| list["label"]["name"].as_str().is_some_and(|name| WORKFLOW_STAGE_LABELS.contains(&name))).collect::<Vec<_>>() }),
-        )
+        let legacy_lists: Vec<_> = final_lists
+            .iter()
+            .filter(|list| {
+                list["label"]["name"]
+                    .as_str()
+                    .is_some_and(|name| LEGACY_WORKFLOW_STAGE_LABELS.contains(&name))
+            })
+            .cloned()
+            .collect();
+        let legacy_cleanup_required = !legacy_lists.is_empty();
+        Ok(json!({
+            "changed":changed,
+            "board":final_board,
+            "workflow_lists":final_lists.iter().filter(|list| list["label"]["name"].as_str().is_some_and(|name| WORKFLOW_STAGE_LABELS.contains(&name))).cloned().collect::<Vec<_>>(),
+            "legacy_lists":legacy_lists,
+            "legacy_cleanup_required":legacy_cleanup_required
+        }))
     }
 }
 

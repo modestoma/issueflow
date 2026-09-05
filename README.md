@@ -75,7 +75,16 @@ issueflow issue close https://gitlab.example.com/group/repo/-/issues/42 --reason
 issueflow issue reopen https://gitlab.example.com/group/repo/-/issues/42
 ```
 
-GitLab transitions support triage, clarification, ready, in-progress and awaiting-review. Close reasons are completed/cancelled/duplicate/invalid, with workflow/resolution label maintenance; reopening returns to triage and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
+GitLab uses the same six-stage model as GitHub: Backlog, Ready, In progress, In review, Done, and Cancelled. Open transitions support backlog, ready, in-progress, and in-review; close reasons are completed/cancelled/duplicate/invalid, with canonical workflow/resolution label maintenance. Clarification is the orthogonal `needs-clarification` label. Reopening returns to Backlog and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
+
+Existing installations can inspect one GitLab issue at a time before migrating legacy labels:
+
+```sh
+issueflow issue reconcile-metadata ISSUE_URL
+issueflow issue reconcile-metadata ISSUE_URL --apply
+```
+
+The command maps the seven legacy Chinese workflow labels to the six canonical stages, preserves clarification separately, maps legacy resolution labels to English values, and derives `blocked` from native blocking relationships. Preview is the default. Apply performs one targeted label update with readback; ambiguous or mixed stages stop without writing. Repository-wide migration and legacy label/list deletion are intentionally not automatic.
 
 ### GitLab Issue Boards
 
@@ -87,7 +96,7 @@ issueflow --platform gitlab --repository group/repo board show 3
 issueflow --platform gitlab --repository group/repo board init-workflow
 ```
 
-`board init-workflow` uses the default name `Issueflow Workflow`; override it with `--name`. It ensures all workflow labels, reuses a unique exact-name board or creates one, adds only missing label lists, orders the seven workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
+`board init-workflow` uses the default name `Issueflow Workflow`; override it with `--name`. It ensures all workflow labels, reuses a unique exact-name board or creates one, adds only missing label lists, orders the six canonical workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Legacy columns are reported as `legacy_lists` with `legacy_cleanup_required=true`; they are not silently deleted. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
 
 ### Dependencies
 

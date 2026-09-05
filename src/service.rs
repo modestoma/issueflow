@@ -425,6 +425,19 @@ impl Service<'_> {
         }
         let current = self.raw_issue().await?;
         let current_labels = labels(&current)?;
+        for prefix in ["type::", "priority::"] {
+            if current_labels
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .count()
+                != 1
+            {
+                return Err(Error::new(
+                    "conflict",
+                    "GitLab workflow metadata requires exactly one type and one priority",
+                ));
+            }
+        }
         let stages: Vec<_> = current_labels
             .iter()
             .filter(|name| {
