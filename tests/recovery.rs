@@ -355,3 +355,199 @@ fn project_blocked_and_resolution_are_authoritative() {
         "manual_review"
     );
 }
+
+#[test]
+fn pending_acceptance_plans_project_repairs_only() {
+    let mut s = completed();
+    s.in_project = false;
+    s.project_status = None;
+    s.resolution = None;
+    let p = plan(&s, DeliveryPolicy::AcceptanceRequired, false);
+    assert_eq!(p.phase, "acceptance_pending");
+    assert_eq!(p.actions, vec!["add_to_project", "set_project_done"]);
+    assert_eq!(p.blockers, vec!["human_acceptance_required"]);
+    s.done_option_available = false;
+    assert!(
+        plan(&s, DeliveryPolicy::AcceptanceRequired, false)
+            .actions
+            .is_empty()
+    );
+}
+
+struct AcceptanceMock {
+    member: Mutex<bool>,
+    done: Mutex<bool>,
+    writes: Mutex<Vec<String>>,
+    pr_reads: Mutex<usize>,
+    change_head: bool,
+    fail_done: bool,
+}
+impl AcceptanceMock {
+    fn new() -> Self {
+        Self {
+            member: Mutex::new(false),
+            done: Mutex::new(false),
+            writes: Mutex::new(vec![]),
+            pr_reads: Mutex::new(0),
+            change_head: false,
+            fail_done: false,
+        }
+    }
+}
+#[async_trait]
+impl Transport for AcceptanceMock {
+    async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        if path == "graphql" {
+            assert_eq!(method, Method::POST);
+            let body = body.unwrap();
+            let q = body["query"].as_str().unwrap();
+            if q.starts_with("mutation") {
+                self.writes.lock().unwrap().push(q.into());
+                if q.contains("addProjectV2ItemById") {
+                    *self.member.lock().unwrap() = true;
+                    return Ok(json!({"data":{"addProjectV2ItemById":{"item":{"id":"ITEM1"}}}}));
+                }
+                assert!(q.contains("updateProjectV2ItemFieldValue"));
+                assert_eq!(body["variables"]["field"], "F1", "must not set Resolution");
+                assert_eq!(body["variables"]["option"], "O1");
+                *self.done.lock().unwrap() = true;
+                if self.fail_done {
+                    return Err(issueflow::error::Error::network(true));
+                }
+                return Ok(
+                    json!({"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM1"}}}}),
+                );
+            }
+            assert!(q.starts_with("query"));
+            if q.contains("items(first:") {
+                let nodes = if *self.member.lock().unwrap() {
+                    let done = *self.done.lock().unwrap();
+                    json!([{"id":"ITEM1","content":{"id":"I1"},"isArchived":false,
+                        "fieldValueByName":{"name":if done {"Done"}else{"In review"},"optionId":if done {"O1"}else{"O2"}},
+                        "resolution":null,"blocked":{"name":"No"}}])
+                } else {
+                    json!([])
+                };
+                return Ok(
+                    json!({"data":{"node":{"items":{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}}}),
+                );
+            }
+            if q.contains("repository(owner:") {
+                return Ok(json!({"data":{"repository":{"issue":{"id":"I1"}}}}));
+            }
+            // Reuse the ordinary metadata fixture for read-only Project queries.
+            let mock = Mock {
+                steps: Mutex::new(VecDeque::new()),
+                calls: Mutex::new(vec![]),
+            };
+            return mock.request(method, path, Some(body)).await;
+        }
+        assert_eq!(method, Method::GET, "must not close or mutate the issue");
+        Ok(if path == "repos/a/b/issues/1" {
+            issue(false)
+        } else if path == "repos/a/b/pulls/2" {
+            let mut reads = self.pr_reads.lock().unwrap();
+            *reads += 1;
+            let mut p = pr();
+            if self.change_head && *reads >= 3 {
+                p["head"]["sha"] = json!("c".repeat(40));
+            }
+            p
+        } else if path.starts_with("repos/a/b/compare/") {
+            compare()
+        } else {
+            panic!("unexpected request: {path}");
+        })
+    }
+}
+#[tokio::test]
+async fn pending_acceptance_applies_done_without_closure_and_repeats_safely() {
+    let m = AcceptanceMock::new();
+    let cfg = cfg();
+    let c = contract();
+    let mut w = workflow();
+    w.delivery_policy = DeliveryPolicy::AcceptanceRequired;
+    let recovery = Recovery {
+        config: &cfg,
+        transport: &m,
+        contract: &c,
+        parent: None,
+        workflow: &w,
+    };
+    let preview = recovery.reconcile(false, false, None).await.unwrap();
+    assert_eq!(
+        preview["plan"]["actions"],
+        json!(["add_to_project", "set_project_done"])
+    );
+    assert!(m.writes.lock().unwrap().is_empty());
+    let result = recovery
+        .reconcile(false, true, Some(&"a".repeat(40)))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["completed_actions"],
+        json!(["add_to_project", "set_project_done"])
+    );
+    assert_eq!(result["plan"]["phase"], "acceptance_pending");
+    assert_eq!(result["snapshot"]["issue_state"], "open");
+    assert_eq!(result["snapshot"]["resolution"], Value::Null);
+    let again = recovery
+        .reconcile(false, true, Some(&"a".repeat(40)))
+        .await
+        .unwrap();
+    assert_eq!(again["applied"], false);
+    assert_eq!(m.writes.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn head_change_between_project_repairs_stops_remaining_writes() {
+    let mut m = AcceptanceMock::new();
+    m.change_head = true;
+    let cfg = cfg();
+    let c = contract();
+    let mut w = workflow();
+    w.delivery_policy = DeliveryPolicy::AcceptanceRequired;
+    let recovery = Recovery {
+        config: &cfg,
+        transport: &m,
+        contract: &c,
+        parent: None,
+        workflow: &w,
+    };
+    let err = recovery
+        .reconcile(false, true, Some(&"a".repeat(40)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "conflict");
+    assert_eq!(m.writes.lock().unwrap().len(), 1);
+    assert!(!*m.done.lock().unwrap());
+}
+#[tokio::test]
+async fn unknown_done_write_recovers_without_repeating_mutation() {
+    let mut m = AcceptanceMock::new();
+    m.fail_done = true;
+    let cfg = cfg();
+    let c = contract();
+    let mut w = workflow();
+    w.delivery_policy = DeliveryPolicy::AcceptanceRequired;
+    let recovery = Recovery {
+        config: &cfg,
+        transport: &m,
+        contract: &c,
+        parent: None,
+        workflow: &w,
+    };
+    assert!(
+        recovery
+            .reconcile(false, true, Some(&"a".repeat(40)))
+            .await
+            .unwrap_err()
+            .outcome_unknown
+    );
+    let result = recovery
+        .reconcile(false, true, Some(&"a".repeat(40)))
+        .await
+        .unwrap();
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["snapshot"]["project_status"], "Done");
+    assert_eq!(m.writes.lock().unwrap().len(), 2);
+}
