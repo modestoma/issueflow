@@ -171,6 +171,23 @@ Push the head branch first. Head and base must be distinct branches in the same 
 
 `pr list` returns open PRs with complete pagination. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
 
+Inspect the evidence for the current PR head before requesting merge approval:
+
+```sh
+issueflow pr checks https://github.com/owner/repo/pull/8
+```
+
+The command reads paginated check runs, latest commit statuses per context, and review history, then rereads the PR to reject head/base changes during inspection. `observed_checks` is `absent`, `pending`, `failed`, `non_failing` (neutral/skipped), or `passed`. No checks is not a pass. Reviews are annotated with whether their commit matches the current head; they are historical records, not an effective approval count. Required branch/ruleset policies and human acceptance are not evaluated, and `merge_authorized` is always false. API permission failures remain errors, never empty evidence. The SHA is evidence provenance, not a persistent authorization token.
+
+Update a PR selectively or mark a Draft ready for review:
+
+```sh
+issueflow pr update https://github.com/owner/repo/pull/8 --file pr-changes.json --expected-head-sha FULL_40_CHARACTER_SHA
+issueflow pr ready https://github.com/owner/repo/pull/8 --expected-head-sha FULL_40_CHARACTER_SHA
+```
+
+Update JSON accepts only optional `title` and `body`. Omitted/null fields are preserved, blank titles and empty updates are rejected, and existing standalone `Refs https://...` lines are retained when replacing the body. No base/head retargeting is performed. Both operations reject closed PRs or stale head expectations and read back their results. This is a read-before-write check, not an atomic lock; concurrent metadata edits may still race. `ready` is a no-op if already ready and currently supports github.com only. Neither command merges or closes issues; GraphQL mutation errors may have unknown outcomes.
+
 After explicit review and merge authorization:
 
 ```sh
@@ -182,7 +199,7 @@ Merge requires an open, non-draft PR with the expected target and full head SHA.
 
 Merging does not invoke issue closure, delete branches, or set Project Status. Verify delivery to the intended base before explicitly closing the issue. A child is complete after acceptance into the parent integration branch; the parent still requires overall acceptance and its own PR into the original target. Project-backed closure uses `--no-workflow-labels`; reopening has the same flag. Multi-step delivery has no cross-API transaction and must be reconciled from remote state after partial failure.
 
-Current commands do not edit PR metadata, read all review/check-run details, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
+Current commands do not evaluate all repository merge policies, create GitLab MRs, or manage native sub-issue relationships. Review required checks using available repository evidence or the PR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls).
 
 ## Output and errors
 
@@ -200,6 +217,21 @@ Exit codes:
 | `5` | Conflict |
 
 Raw server error bodies are not printed, to avoid accidentally exposing credentials. The HTTP status is retained in `status`. Clap command usage errors use the standard CLI help format. A GitHub `403` can also indicate secondary rate limiting and requires interpretation in context.
+
+## Workflow configuration and capability discovery
+
+```sh
+issueflow capabilities
+issueflow workflow validate --file .issue-workflow.json
+```
+
+These commands run offline before `.env` or environment configuration is loaded. `capabilities` derives its command/option tree from the installed CLI parser, so different builds can be distinguished even when their package versions match. It does not imply remote permissions.
+
+Workflow validation checks a GitHub-only, secret-free schema with `schema_version: 1`, `platform: "github"`, `host: "github.com"`, full `repository`, `remote`, `base_branch`, `timezone: "Asia/Shanghai"`, and explicit `permissions`. Optional fields include `proposer`, `verification_commands`, `manual_acceptance`, `delivery_condition`, `github_project_url`, and `branch_prefixes`. Unknown fields (including token fields) are rejected; configured commands are never executed. Validation neither changes API routing nor grants authorization. Existing API commands still use their normal explicit flags/environment configuration.
+
+`delivery_policy` is `merged` when approved merge into the contracted target completes delivery, or `acceptance_required` when deployment/device/business acceptance remains necessary. Omission defaults to `acceptance_required`. Both policies still require user merge approval. `permissions` retains independent local_commit/push flags and optional pull_request/draft_pr_mr flags; a legacy Draft permission is not promoted to general PR permission.
+
+Project URLs are validated against the supported canonical github.com user/org format without contacting the server. Credential configuration remains separate; no `.env` is needed when the process already has `ISSUEFLOW_GITHUB_TOKEN`.
 
 ## Configuration
 
