@@ -183,7 +183,7 @@ Example `pr.json` (UTF-8; `--file -` also accepts stdin):
 
 Push the head branch first. Head and base must be distinct branches in the same repository; fork heads are not supported in this version. Unknown JSON fields are rejected. The CLI appends `Refs <issue URL>` rather than an automatic closing keyword; do not include `Fixes` or `Closes` directives yourself if closure must wait for acceptance. PR output retains GitHub's native fields, including `html_url`, `head.sha`, and `base.ref`.
 
-`pr list` returns open PRs with complete pagination. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
+`pr list` defaults to open PRs with complete pagination; `--state closed`, `--state merged`, and `--state all` support historical lookup. Creation reuses an existing open PR for the same head/base only when its body contains the same issue reference; it does not overwrite the existing PR. Reusing a PR does not update its title/body/draft state. Push further commits to the same branch to update its diff. If creation has an unknown outcome, inspect open PRs before retrying; a momentarily empty list is not proof of failure.
 
 Inspect the evidence for the current PR head before requesting merge approval:
 
@@ -238,6 +238,24 @@ A contract is a small JSON artifact that can be kept in the issue body and mater
 The parent file uses the same schema with its own issue URL/branch and original target; a root uses `parent_issue_url: null`. Validation requires source and PR target to agree, distinct development/target branches, same-repository issue/PR URLs, and a child's target to equal the supplied parent's branch. A child without its parent file is not considered validated. Unknown fields are rejected. This runs offline and never loads credentials or mutates branches.
 
 The result explicitly sets `remote_verified: false`: local validation does not prove branches exist, inspect actual PR targets, grant merge permission, or validate a full ancestor graph. Read the actual PR before merging and compare its head/base with the contract. The parent still needs overall acceptance after its children deliver.
+
+## Recover interrupted workflow delivery
+
+```sh
+issueflow --no-env-file workflow inspect --file child.json --parent-file parent.json --config-file .issue-workflow.json
+issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json
+issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json --apply --expected-head-sha FULL_40_CHARACTER_SHA
+```
+
+Both `inspect` and `reconcile` are **read-only by default**. They validate the branch contract and workflow configuration, resolve an explicit PR URL or search all PR states for the contracted head/base, verify the issue reference, and inspect native issue and Project state. Multiple matching historical PRs require an explicit `pr_url`; none is reported as `no_pr`, never treated as permission to create a new PR.
+
+A merged PR is considered delivered only when its merge commit is reachable from the contracted target according to GitHub's compare API. A missing/deleted target or unreadable evidence prevents automatic completion. Returned phases include `no_pr`, `in_progress`, `in_review`, `delivery_pending`, `acceptance_pending`, `manual_review`, `reconciliation_needed`, and `complete`.
+
+Under `delivery_policy: "merged"`, verified target delivery allows closure planning. Under `acceptance_required`, the caller must explicitly pass `--accepted` only after human acceptance has been confirmed; a green check or merged PR is insufficient. Reuse an existing confirmed acceptance decision when resuming, rather than asking the user repeatedly. Configuration and these flags do not grant merge permission.
+
+Only explicit `--apply` performs missing actions, guarded by the expected PR head: add missing Project membership, set Project Status to Done, and/or close the native issue while preserving labels. The workflow configuration supplies the Project URL. Project-backed recovery removes redundant workflow-stage labels; without a Project it reconciles the workflow stage label to `workflow::已完成`. Type, priority and other unrelated labels are preserved. Missing/ambiguous Done options, archived items, terminated issues, unknown closure reasons, or unmerged PRs block writes. Terminated issues are never reopened or relabeled as completed.
+
+Evidence is refreshed before each action and after completion. Repeating a completed recovery is a no-op. The command never merges a PR, creates an issue/PR, modifies local Git state, or posts comments. Partial failures report confirmed completed steps and unknown outcomes; inspect again instead of replaying a merge or a stale plan. These checks and cross-API writes are not atomic: concurrent retargeting, force pushes, acceptance changes or Project automations still require reconciliation. PR/issue references and caller-supplied acceptance are not a distributed lock or cryptographic proof of approval.
 
 ## Output and errors
 

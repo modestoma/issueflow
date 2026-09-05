@@ -52,6 +52,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WorkflowCommand {
+    /// Read remote delivery state and propose missing recovery steps
+    Inspect(RecoveryArgs),
+    /// Inspect by default; explicitly apply only missing eligible steps
+    Reconcile {
+        #[command(flatten)]
+        args: RecoveryArgs,
+        #[arg(long, requires = "expected_head_sha")]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        expected_head_sha: Option<String>,
+    },
     ValidateContract {
         #[arg(long)]
         file: PathBuf,
@@ -62,6 +73,19 @@ enum WorkflowCommand {
         #[arg(long, default_value = ".issue-workflow.json")]
         file: PathBuf,
     },
+}
+
+#[derive(clap::Args)]
+struct RecoveryArgs {
+    #[arg(long)]
+    file: PathBuf,
+    #[arg(long)]
+    parent_file: Option<PathBuf>,
+    #[arg(long, default_value = ".issue-workflow.json")]
+    config_file: PathBuf,
+    /// Assert human acceptance was explicitly confirmed; never inferred from CI
+    #[arg(long)]
+    accepted: bool,
 }
 
 fn command_schema(c: &clap::Command) -> Value {
@@ -102,6 +126,8 @@ enum PullCommand {
         expected_head_sha: String,
     },
     List {
+        #[arg(long, value_enum, default_value = "open")]
+        state: issueflow::pull::PullState,
         #[arg(long)]
         head: Option<String>,
         #[arg(long)]
@@ -299,6 +325,36 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
         );
     }
+    if let Command::Workflow(command) = command {
+        let (args, apply, expected) = match command {
+            WorkflowCommand::Inspect(args) => (args, false, None),
+            WorkflowCommand::Reconcile {
+                args,
+                apply,
+                expected_head_sha,
+            } => (args, apply, expected_head_sha),
+            _ => unreachable!("offline workflow command handled before configuration"),
+        };
+        let contract = input::<issueflow::branch_contract::BranchContract>(&args.file)?;
+        let parent = args
+            .parent_file
+            .as_ref()
+            .map(|p| input::<issueflow::branch_contract::BranchContract>(p))
+            .transpose()?;
+        let workflow = input::<issueflow::workflow_config::WorkflowConfig>(&args.config_file)?;
+        workflow.validate()?;
+        contract.validate(parent.as_ref())?;
+        let transport = SdkTransport::new(&config, issueflow::config::Platform::Github)?;
+        return issueflow::recovery::Recovery {
+            config: &config,
+            transport: &transport,
+            contract: &contract,
+            parent: parent.as_ref(),
+            workflow: &workflow,
+        }
+        .reconcile(args.accepted, apply, expected.as_deref())
+        .await;
+    }
     if let Command::Pr(command) = command {
         use issueflow::pull::{Pulls, target_from_url};
         let target = match &command {
@@ -327,8 +383,10 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             target,
         };
         return match command {
-            PullCommand::List { head, base } => {
-                service.list(head.as_deref(), base.as_deref()).await
+            PullCommand::List { head, base, state } => {
+                service
+                    .list_state(head.as_deref(), base.as_deref(), state)
+                    .await
             }
             PullCommand::Show { .. } => service.show().await,
             PullCommand::Checks { .. } => {

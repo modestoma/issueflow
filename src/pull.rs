@@ -29,6 +29,13 @@ pub struct UpdatePull {
     pub body: Option<String>,
 }
 #[derive(Clone, Copy, ValueEnum)]
+pub enum PullState {
+    Open,
+    Closed,
+    All,
+    Merged,
+}
+#[derive(Clone, Copy, ValueEnum)]
 pub enum MergeMethod {
     Merge,
     Squash,
@@ -120,6 +127,14 @@ impl Pulls<'_> {
         Ok(v)
     }
     pub async fn list(&self, head: Option<&str>, base: Option<&str>) -> Result<Value> {
+        self.list_state(head, base, PullState::Open).await
+    }
+    pub async fn list_state(
+        &self,
+        head: Option<&str>,
+        base: Option<&str>,
+        state: PullState,
+    ) -> Result<Value> {
         if let Some(s) = head {
             branch(s)?;
         }
@@ -127,8 +142,13 @@ impl Pulls<'_> {
             branch(s)?;
         }
         let mut endpoint = format!(
-            "{}?state=open&sort=created&direction=asc",
-            self.collection()?
+            "{}?state={}&sort=created&direction=asc",
+            self.collection()?,
+            match state {
+                PullState::Open => "open",
+                PullState::Closed | PullState::Merged => "closed",
+                PullState::All => "all",
+            }
         );
         if let Some(h) = head {
             let owner = self.target.repository.split('/').next().unwrap();
@@ -141,7 +161,11 @@ impl Pulls<'_> {
             transport: self.transport,
             target: self.target.clone(),
         };
-        Ok(json!(service.pages(&endpoint).await?))
+        let mut items = service.pages(&endpoint).await?;
+        if matches!(state, PullState::Merged) {
+            items.retain(|p| p["merged_at"].is_string());
+        }
+        Ok(json!(items))
     }
     pub async fn create(&self, input: CreatePull, issue_url: &str) -> Result<Value> {
         github(&self.target)?;
