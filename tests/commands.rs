@@ -35,11 +35,25 @@ fn capabilities_exclude_hidden_compatibility_commands() {
     let output = binary().arg("capabilities").output().unwrap();
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let text = value.to_string();
-    assert!(!text.contains("hierarchy"));
-    assert!(!text.contains("dependencies"));
-    assert!(text.contains("relationships"));
-    assert!(text.contains("sub-issues"));
+    let top_level = value["cli"]["subcommands"].as_array().unwrap();
+    let top_level_names = top_level
+        .iter()
+        .filter_map(|command| command["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!top_level_names.contains(&"hierarchy"));
+    let issue = top_level
+        .iter()
+        .find(|command| command["name"] == "issue")
+        .unwrap();
+    let issue_names = issue["subcommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|command| command["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!issue_names.contains(&"dependencies"));
+    assert!(issue_names.contains(&"relationships"));
+    assert!(issue_names.contains(&"sub-issues"));
 }
 
 #[test]

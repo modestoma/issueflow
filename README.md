@@ -363,7 +363,7 @@ Open PRs cannot reveal unpublished child work. After separately reviewing child 
 
 ## Output and errors
 
-Successful commands write JSON to stdout; errors write JSON to stderr. Normalized issue results contain `platform`, `id`, `number`, `url`, `title`, `body`, `state`, `issue_type`, `labels`, `created_at`, and `updated_at`. `id` is the platform-wide ID; `number` is the repository's native issue number (GitLab `iid`); `issue_type` is `issue` for GitHub and the lower-case native Issue/Task type for GitLab when the API provides it. Comments and dependencies retain platform-native JSON.
+Interactive terminals receive concise human-readable summaries and tables; `--verbose` adds safe detail. Redirected stdout and explicit `--json` output remain deterministic JSON. Errors and deprecation warnings use stderr, with errors remaining JSON when stderr is not a terminal or `--json` is set. Normalized issue results contain `platform`, `id`, `number`, `url`, `title`, `body`, `state`, `issue_type`, `labels`, `created_at`, and `updated_at`. `id` is the platform-wide ID; `number` is the repository's native issue number (GitLab `iid`); `issue_type` is `issue` for GitHub and the lower-case native Issue/Task type for GitLab when the API provides it. Comments and dependencies retain platform-native JSON.
 
 Exit codes:
 

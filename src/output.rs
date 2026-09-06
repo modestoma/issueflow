@@ -15,10 +15,26 @@ pub fn render_success(value: &Value, verbose: bool) -> String {
     if looks_like_config(value) {
         return render_object("Configuration", value, verbose);
     }
+    if let Some(issue) = value.get("issue").filter(|issue| looks_like_issue(issue)) {
+        let mut result = render_issue(issue, verbose);
+        if let Some(comments) = value.get("comments").and_then(Value::as_array) {
+            result.push_str(&format!("\nComments: {}", comments.len()));
+        }
+        return result;
+    }
     if looks_like_issue(value) {
         return render_issue(value, verbose);
     }
+    if value.get("sub_issues").is_some()
+        && value.get("blocked_by").is_some()
+        && value.get("blocking").is_some()
+    {
+        return render_relationships(value, verbose);
+    }
     match value {
+        Value::Array(items) if looks_like_sub_issue_tree(items) => {
+            render_sub_issue_tree(items, verbose)
+        }
         Value::Array(items) => render_array(items, verbose),
         Value::Object(_) => render_object("Result", value, verbose),
         _ => scalar(value),
@@ -45,7 +61,7 @@ fn looks_like_config(value: &Value) -> bool {
 }
 
 fn looks_like_issue(value: &Value) -> bool {
-    value.get("number").is_some() && value.get("title").is_some() && value.get("url").is_some()
+    value.get("number").is_some() && value.get("title").is_some() && resource_url(value).is_some()
 }
 
 fn render_capabilities(value: &Value, verbose: bool) -> String {
@@ -55,6 +71,39 @@ fn render_capabilities(value: &Value, verbose: bool) -> String {
         .map(scalar)
         .unwrap_or_default();
     let mut result = format!("issueflow {version}\nCapability schema: {schema}");
+    if let Some(platforms) = value.get("platforms").and_then(Value::as_object) {
+        result.push_str("\n\nPlatform support\n");
+        let rows = platforms
+            .iter()
+            .map(|(platform, support)| {
+                vec![
+                    platform.clone(),
+                    field(support, "issues"),
+                    field(support, "sub_issues"),
+                    field(support, "dependencies"),
+                    support
+                        .get("pull_requests")
+                        .or_else(|| support.get("merge_requests"))
+                        .map(scalar)
+                        .unwrap_or_default(),
+                    field(support, "kanban"),
+                    field(support, "delivery_recovery"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        result.push_str(&table(
+            &[
+                "PLATFORM",
+                "ISSUES",
+                "SUB-ISSUES",
+                "DEPENDENCIES",
+                "PR / MR",
+                "KANBAN",
+                "DELIVERY",
+            ],
+            &rows,
+        ));
+    }
     if let Some(commands) = value.pointer("/cli/subcommands").and_then(Value::as_array) {
         result.push_str("\n\nCommands\n");
         let rows = commands
@@ -79,7 +128,7 @@ fn render_doctor(value: &Value, verbose: bool) -> String {
                 vec![
                     field(check, "name"),
                     field(check, "status"),
-                    field(check, "detail"),
+                    check.get("detail").map(compact_detail).unwrap_or_default(),
                 ]
             })
             .collect::<Vec<_>>();
@@ -96,12 +145,82 @@ fn render_doctor(value: &Value, verbose: bool) -> String {
     render_object("Diagnostics", value, verbose)
 }
 
+fn render_relationships(value: &Value, verbose: bool) -> String {
+    let mut result = "Relationships".to_string();
+    let parent = &value["parent"];
+    result.push_str("\nParent: ");
+    result.push_str(if parent.is_null() {
+        "-"
+    } else {
+        parent
+            .get("html_url")
+            .or_else(|| parent.get("webUrl"))
+            .or_else(|| parent.get("web_url"))
+            .or_else(|| parent.get("url"))
+            .and_then(Value::as_str)
+            .unwrap_or("present")
+    });
+    if let Some(summary) = value.get("sub_issues_summary") {
+        result.push_str(&format!(
+            "\nSub-issues: {} / {} completed",
+            field(summary, "completed"),
+            field(summary, "total")
+        ));
+    }
+    for (label, key) in [
+        ("Sub-issues", "sub_issues"),
+        ("Blocked by", "blocked_by"),
+        ("Blocking", "blocking"),
+    ] {
+        result.push_str(&format!("\n\n{label}\n"));
+        let items = value[key].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        result.push_str(&render_array(items, false));
+    }
+    if verbose {
+        result.push_str("\n\nDetails\n");
+        render_value(value, "", &mut result, 0, true);
+    }
+    result
+}
+
+fn looks_like_sub_issue_tree(items: &[Value]) -> bool {
+    !items.is_empty()
+        && items
+            .iter()
+            .all(|item| item.get("depth").is_some() && item.get("position").is_some())
+}
+
+fn render_sub_issue_tree(items: &[Value], verbose: bool) -> String {
+    let mut result = "Sub-issues".to_string();
+    for item in items {
+        let depth = item["depth"].as_u64().unwrap_or(1).max(1);
+        let number = field(item, "number");
+        let title = field(item, "title");
+        let state = field(item, "state");
+        result.push_str(&format!(
+            "\n{}- #{} {} [{}]",
+            "  ".repeat((depth - 1) as usize),
+            number,
+            title,
+            state
+        ));
+    }
+    if verbose {
+        result.push_str("\n\nDetails\n");
+        render_value(&Value::Array(items.to_vec()), "", &mut result, 0, true);
+    }
+    result
+}
+
 fn render_issue(value: &Value, verbose: bool) -> String {
     let mut result = format!("#{}  {}", field(value, "number"), field(value, "title"));
-    let rows = ["state", "platform", "url"]
+    let mut rows = ["state", "platform"]
         .iter()
         .filter_map(|key| value.get(*key).map(|v| vec![label(key), scalar(v)]))
         .collect::<Vec<_>>();
+    if let Some(url) = resource_url(value) {
+        rows.push(vec!["url".into(), url.into()]);
+    }
     if !rows.is_empty() {
         result.push_str("\n\n");
         result.push_str(&table(&["FIELD", "VALUE"], &rows));
@@ -111,6 +230,12 @@ fn render_issue(value: &Value, verbose: bool) -> String {
         render_value(value, "", &mut result, 0, true);
     }
     result
+}
+
+fn resource_url(value: &Value) -> Option<&str> {
+    ["url", "html_url", "web_url", "webUrl"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
 fn render_array(items: &[Value], verbose: bool) -> String {
@@ -314,6 +439,23 @@ fn summary(value: &Value) -> String {
     }
 }
 
+fn compact_detail(value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return scalar(value);
+    };
+    let details = object
+        .iter()
+        .filter(|(key, value)| !is_sensitive_key(key) && is_compact(value))
+        .take(3)
+        .map(|(key, value)| format!("{}={}", label(key), scalar(value)))
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        summary(value)
+    } else {
+        details.join(", ")
+    }
+}
+
 fn scalar(value: &Value) -> String {
     match value {
         Value::Null => "-".into(),
@@ -353,6 +495,22 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_render_platform_support_as_a_matrix() {
+        let output = render_success(
+            &json!({
+                "version":"1.0.0",
+                "capability_schema_version":2,
+                "platforms":{"github":{"issues":"supported","sub_issues":"supported","dependencies":"supported","pull_requests":"supported","kanban":"Projects","delivery_recovery":"supported"}},
+                "cli":{"subcommands":[]}
+            }),
+            false,
+        );
+        assert!(output.contains("Platform support"));
+        assert!(output.contains("SUB-ISSUES"));
+        assert!(output.contains("Projects"));
+    }
+
+    #[test]
     fn verbose_capabilities_include_details() {
         let output = render_success(
             &json!({"version":"1.0.0","capability_schema_version":1,"cli":{"name":"issueflow","subcommands":[]}}),
@@ -379,6 +537,17 @@ mod tests {
     }
 
     #[test]
+    fn native_issue_urls_and_comment_wrappers_are_compact() {
+        let output = render_success(
+            &json!({"issue":{"number":12,"title":"Native","state":"open","html_url":"https://example.test/issues/12","body":"long"},"comments":[]}),
+            false,
+        );
+        assert!(output.starts_with("#12  Native"));
+        assert!(output.contains("Comments: 0"));
+        assert!(!output.contains("long"));
+    }
+
+    #[test]
     fn doctor_check_rows_show_warnings() {
         let output = render_success(
             &json!({"checks":[{"name":"repository","status":"warning","detail":"not configured"}]}),
@@ -387,6 +556,29 @@ mod tests {
         assert!(output.contains("CHECK"));
         assert!(output.contains("warning"));
         assert!(output.contains("not configured"));
+    }
+
+    #[test]
+    fn doctor_summarizes_structured_check_details() {
+        let output = render_success(
+            &json!({"checks":[{"name":"kanban","status":"passed","detail":{"ready":true,"project":"https://example.test/project"}}]}),
+            false,
+        );
+        assert!(output.contains("ready=yes"));
+        assert!(output.contains("project=https://example.test/project"));
+    }
+
+    #[test]
+    fn recursive_sub_issues_render_as_a_tree() {
+        let output = render_success(
+            &json!([
+                {"number":2,"title":"child","state":"open","depth":1,"position":1},
+                {"number":3,"title":"grandchild","state":"closed","depth":2,"position":1}
+            ]),
+            false,
+        );
+        assert!(output.contains("\n- #2 child [open]"));
+        assert!(output.contains("\n  - #3 grandchild [closed]"));
     }
 
     #[test]

@@ -600,6 +600,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
     if matches!(command, Command::SetupLabels) {
         eprintln!("warning: `setup-labels` is deprecated; use `kanban init` instead");
     }
+    if matches!(command, Command::Issue(IssueCommand::Dependencies { .. })) {
+        eprintln!("warning: `issue dependencies` is deprecated; use `issue blocked-by` instead");
+    }
     if let Command::Config { command } = command {
         debug_assert!(matches!(command, None | Some(ConfigCommand::Show)));
         return Ok(config.redacted());
