@@ -13,11 +13,11 @@ cargo build --release
 
 The examples below assume the built executable is available as `issueflow` on your `PATH`. You can also use `./target/release/issueflow` from the repository root.
 
-After configuring credentials, start with a read-only connectivity check. `doctor` verifies authentication only; it does not establish repository write permissions:
+After configuring credentials, start with a read-only diagnostic check. `doctor` verifies the effective platform and repository configuration, endpoint reachability, authentication, repository readability, and Kanban readiness. It never mutates remote state and reports write permission as `unknown` because successful reads do not prove mutation access:
 
 ```sh
-issueflow --platform github doctor
-issueflow --platform gitlab doctor
+issueflow --platform github --repository owner/repo doctor --config-file .issue-workflow.json
+issueflow --platform gitlab --repository group/repo doctor
 issueflow --platform github --repository owner/repo issue list
 issueflow issue show https://github.com/owner/repo/issues/42 --comments
 issueflow issue comments https://gitlab.example.com/group/repo/-/issues/42
@@ -197,7 +197,7 @@ issueflow project field PROJECT_URL ISSUE_URL --name Resolution --clear
 Omitting `--to` and `--clear` reads the field. Names/options match exactly; missing/ambiguous fields fail before writing. Add the issue first. Clear Resolution on reopening, reconsider Blocked and set the actual workflow stage. The CLI does not read legacy labels to infer these values or bulk-remove them. Migrate existing issue metadata deliberately before switching its source of truth.
 
 
-After successful readback, record the selected URL as `github_project_url` in the repository's secret-free `.issue-workflow.json` and run `workflow validate`. Do not save guessed URLs or create a new Project merely because an existing one is inaccessible. The CLI does not automatically overwrite local configuration or provision every repository; these commands are explicit onboarding actions.
+After successful readback, record the selected URL as `github_project_url` in the repository's secret-free `.issue-workflow.json` and run `config validate`. Do not save guessed URLs or create a new Project merely because an existing one is inaccessible. The CLI does not automatically overwrite local configuration or provision every repository; these commands are explicit onboarding actions.
 
 ### Projects authentication and failure handling
 
@@ -280,7 +280,7 @@ GitHub uses native Sub-issues REST endpoints. Adds traverse up to 1,000 descenda
 ### Validate parent/child branch contracts
 
 ```sh
-issueflow workflow validate-contract --file child.json --parent-file parent.json
+issueflow delivery validate-contract --file child.json --parent-file parent.json
 ```
 
 A contract is a small JSON artifact that can be kept in the issue body and materialized temporarily for validation; no local issue registry is required:
@@ -301,12 +301,12 @@ The parent file uses the same schema with its own issue URL/branch and original 
 
 The result explicitly sets `remote_verified: false`: local validation does not prove branches exist, inspect actual PR targets, grant merge permission, or validate a full ancestor graph. Read the actual PR before merging and compare its head/base with the contract. The parent still needs overall acceptance after its children deliver.
 
-## Recover interrupted workflow delivery
+## Recover interrupted delivery
 
 ```sh
-issueflow --no-env-file workflow inspect --file child.json --parent-file parent.json --config-file .issue-workflow.json
-issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json
-issueflow --no-env-file workflow reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json --apply --expected-head-sha FULL_40_CHARACTER_SHA
+issueflow --no-env-file delivery inspect --file child.json --parent-file parent.json --config-file .issue-workflow.json
+issueflow --no-env-file delivery reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json
+issueflow --no-env-file delivery reconcile --file child.json --parent-file parent.json --config-file .issue-workflow.json --apply --expected-head-sha FULL_40_CHARACTER_SHA
 ```
 
 Both `inspect` and `reconcile` are **read-only by default**. They validate the branch contract and workflow configuration, resolve an explicit PR/MR URL or search all states for the contracted head/base, verify the issue reference, and inspect native workflow state. GitHub reads required Project fields; GitLab reads its single workflow stage plus blocking/resolution labels. Multiple matching historical PRs/MRs require an explicit `pr_url`; none is reported as `no_pr`, never treated as permission to create one.
@@ -324,7 +324,7 @@ Evidence is refreshed before each action and after completion. Repeating a compl
 ## Inspect worktree cleanup eligibility
 
 ```sh
-issueflow --no-env-file workflow cleanup-check --file child.json --parent-file parent.json --config-file .issue-workflow.json --worktree /absolute/path/to/worktree
+issueflow --no-env-file delivery cleanup-check --file child.json --parent-file parent.json --config-file .issue-workflow.json --worktree /absolute/path/to/worktree
 ```
 
 This command never deletes files, worktrees, or branches. It combines recovery evidence with local Git inspection and open PRs targeting the candidate branch. The exact registered worktree root, expected branch and repository remote must match. Main worktrees, locked worktrees, tracked modifications, untracked files, ignored files, incomplete remote delivery, or a local HEAD different from the reviewed PR head prevent eligibility. Ignored files include `.env` and generated `target/` output; the tool does not silently assume they are disposable. Git inspection disables optional index locks and filesystem monitor hooks.
@@ -356,10 +356,10 @@ Raw server error bodies are not printed, to avoid accidentally exposing credenti
 
 ```sh
 issueflow capabilities
-issueflow workflow validate --file .issue-workflow.json
+issueflow config validate --file .issue-workflow.json
 ```
 
-These commands run offline before `.env` or environment configuration is loaded. `capabilities` derives its command/option tree from the installed CLI parser, so different builds can be distinguished even when their package versions match. It does not imply remote permissions.
+These commands run offline before `.env` or environment configuration is loaded. `capabilities` reports an installed GitHub/GitLab support matrix, explicit limitations, and a versioned command/option schema derived from the installed parser. It does not report the configured platform and does not imply remote permissions. Use `config show` for effective local configuration and `doctor` for live read-only diagnostics.
 
 Workflow validation checks a secret-free schema with `schema_version: 1`, `platform` set to `github` or `gitlab`, the exact host, full repository path, `remote`, `base_branch`, `timezone: "Asia/Shanghai"`, and explicit `permissions`. GitHub requires its normal Project setup before recovery can proceed; GitLab rejects `github_project_url` and uses labels. Unknown fields (including token fields) are rejected; configured commands are never executed. Runtime recovery also requires the workflow host to match the configured API host, and validation never grants authorization.
 
@@ -388,9 +388,9 @@ By default, only `.env` in the current working directory is loaded; parent direc
 
 ```sh
 cp .env.example .env
-cargo run -- config
-cargo run -- --env-file /path/to/project.env config
-cargo run -- --no-env-file --timeout-seconds 60 config
+cargo run -- config show
+cargo run -- --env-file /path/to/project.env config show
+cargo run -- --no-env-file --timeout-seconds 60 config show
 ```
 
 `.env` supports dotenvy quoting, comments, and variable expansion. Use single quotes for values containing a literal `$`. Duplicate `ISSUEFLOW_` entries in the file are rejected. Empty process environment values still override file values: an empty token is treated as unconfigured and does not fall back to credentials in the file.
@@ -407,7 +407,9 @@ cargo run -- --no-env-file --timeout-seconds 60 config
 
 Corresponding non-credential flags are `--platform`, `--repository`, `--github-api-url`, `--gitlab-url`, and `--timeout-seconds`. URLs must use HTTPS and cannot contain embedded credentials, query parameters, or fragments. Instance base paths are supported. All configuration is validated, but inspecting configuration does not require a token.
 
-`config` writes JSON that reports only whether tokens are configured, never their contents. Errors go to stderr; configuration errors use exit code `2`. `.env` and `.env.*` are ignored by Git, with an exception for `.env.example`. Never place real credentials in examples or command-line arguments.
+`config show` writes structured output that reports only whether tokens are configured, never their contents. `config validate` is offline and validates the secret-free project workflow file. Errors go to stderr; configuration errors use exit code `2`. `.env` and `.env.*` are ignored by Git, with an exception for `.env.example`. Never place real credentials in examples or command-line arguments.
+
+For one compatibility release, bare `config` behaves like `config show`, and the old `workflow` paths continue to route to `delivery` or `config validate`. These aliases are hidden from normal help and emit deprecation warnings only on stderr, so JSON stdout remains parseable.
 
 ## Development validation
 

@@ -6,7 +6,7 @@ use issueflow::{
     error::{Error, Result},
     service::{CloseReason, Service, Stage},
     target::Target,
-    transport::{SdkTransport, Transport},
+    transport::SdkTransport,
 };
 use serde_json::{Value, json};
 use std::io::Read;
@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Inspect installed command capabilities without loading credentials
+    /// Show installed GitHub and GitLab support; does not inspect configuration or permissions
     Capabilities,
     /// Read and maintain native parent/child relationships
     #[command(subcommand)]
@@ -36,24 +36,37 @@ enum Command {
     /// Read and initialize GitLab project issue boards
     #[command(subcommand)]
     Board(BoardCommand),
-    /// Validate a secret-free GitHub workflow configuration (offline)
+    /// Validate effective or secret-free project configuration
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
+    /// Inspect and reconcile issue delivery state
     #[command(subcommand)]
-    Workflow(WorkflowCommand),
-    /// Create, inspect and explicitly merge GitHub pull requests
+    Delivery(DeliveryCommand),
+    /// Create, inspect and explicitly merge GitHub PRs and same-project GitLab MRs
     #[command(subcommand)]
     Pr(PullCommand),
     /// Read and manage GitHub Projects v2
     #[command(subcommand)]
     Project(ProjectCommand),
-    /// Show effective configuration as JSON; credentials are never included
-    Config,
-    /// Check API authentication for the configured platform (read-only)
-    Doctor,
+    /// Run read-only configuration, API, repository, and Kanban diagnostics
+    Doctor {
+        /// Secret-free project workflow configuration used to locate GitHub Projects
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+        /// Expected GitLab workflow board name
+        #[arg(long, default_value = "Issueflow Workflow")]
+        board_name: String,
+    },
     /// Create missing workflow labels in the default GitLab repository
     SetupLabels,
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+    /// Deprecated compatibility alias for delivery and configuration validation
+    #[command(subcommand, hide = true)]
+    Workflow(DeliveryCommand),
 }
 
 #[derive(Subcommand)]
@@ -87,7 +100,18 @@ enum BoardCommand {
 }
 
 #[derive(Subcommand)]
-enum WorkflowCommand {
+enum ConfigCommand {
+    /// Show effective configuration; credentials are always redacted
+    Show,
+    /// Validate a secret-free project workflow configuration without loading credentials
+    Validate {
+        #[arg(long, default_value = ".issue-workflow.json")]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeliveryCommand {
     /// Read-only worktree cleanup eligibility; never deletes anything
     CleanupCheck {
         #[command(flatten)]
@@ -115,6 +139,8 @@ enum WorkflowCommand {
         #[arg(long)]
         parent_file: Option<PathBuf>,
     },
+    /// Deprecated compatibility alias for config validate
+    #[command(hide = true)]
     Validate {
         #[arg(long, default_value = ".issue-workflow.json")]
         file: PathBuf,
@@ -135,7 +161,44 @@ struct RecoveryArgs {
 }
 
 fn command_schema(c: &clap::Command) -> Value {
-    json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
+    json!({"name":c.get_name(),"hidden":c.is_hide_set(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
+}
+
+fn capabilities() -> Value {
+    let schema = command_schema(&Cli::command());
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "capability_schema_version": 2,
+        "scope": "installed_support",
+        "configured_platform": Value::Null,
+        "remote_permissions_checked": false,
+        "platforms": {
+            "github": {
+                "issues": "supported",
+                "sub_issues": "supported",
+                "dependencies": "supported",
+                "pull_requests": "supported",
+                "kanban": "GitHub Projects v2",
+                "delivery_recovery": "supported"
+            },
+            "gitlab": {
+                "issues": "supported",
+                "sub_issues": "same-project Issue to Task",
+                "dependencies": "supported",
+                "merge_requests": "same-project",
+                "kanban": "GitLab Issue Boards",
+                "delivery_recovery": "supported"
+            }
+        },
+        "limitations": [
+            "This command reports installed support, not the selected platform or live permissions.",
+            "GitHub Projects currently supports github.com only.",
+            "GitLab hierarchy is limited to same-project Issue to Task relationships.",
+            "GitLab merge requests must use branches in the same project."
+        ],
+        "cli_schema": schema.clone(),
+        "cli": schema
+    })
 }
 fn finish(result: Result<Value>) -> ExitCode {
     match result {
@@ -399,18 +462,36 @@ fn input<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
 }
 
 async fn execute(command: Command, config: Config) -> Result<Value> {
-    if matches!(command, Command::Config) {
+    if let Command::Config { command } = command {
+        debug_assert!(matches!(command, None | Some(ConfigCommand::Show)));
         return Ok(config.redacted());
     }
-    if matches!(command, Command::Doctor) {
-        let platform = config
-            .platform
-            .ok_or_else(|| Error::new("configuration", "doctor 需要指定平台"))?;
-        let transport = SdkTransport::new(&config, platform)?;
-        let user = transport.request(http::Method::GET, "user", None).await?;
-        return Ok(
-            json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
-        );
+    if let Command::Doctor {
+        config_file,
+        board_name,
+    } = command
+    {
+        let target = Target::defaults(&config)?;
+        let transport = SdkTransport::new(&config, target.platform)?;
+        let workflow_path = config_file.or_else(|| {
+            let default = PathBuf::from(".issue-workflow.json");
+            default.exists().then_some(default)
+        });
+        let workflow = workflow_path
+            .as_ref()
+            .map(|path| input::<issueflow::workflow_config::WorkflowConfig>(path))
+            .transpose()?;
+        if let Some(workflow) = &workflow {
+            workflow.validate()?;
+        }
+        return issueflow::doctor::inspect(
+            &config,
+            &transport,
+            target,
+            workflow.as_ref(),
+            &board_name,
+        )
+        .await;
     }
     if let Command::Hierarchy(command) = command {
         let parent_url = match &command {
@@ -454,10 +535,10 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             BoardCommand::InitWorkflow { name } => boards.init_workflow(&name).await,
         };
     }
-    if let Command::Workflow(command) = command {
+    if let Command::Delivery(command) | Command::Workflow(command) = command {
         let (args, apply, expected, cleanup) = match command {
-            WorkflowCommand::Inspect(args) => (args, false, None, None),
-            WorkflowCommand::CleanupCheck {
+            DeliveryCommand::Inspect(args) => (args, false, None, None),
+            DeliveryCommand::CleanupCheck {
                 args,
                 worktree,
                 confirm_no_dependent_work,
@@ -467,7 +548,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 None,
                 Some((worktree, confirm_no_dependent_work)),
             ),
-            WorkflowCommand::Reconcile {
+            DeliveryCommand::Reconcile {
                 args,
                 apply,
                 expected_head_sha,
@@ -743,12 +824,20 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Capabilities => {
-            return finish(Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
-            ));
+        Command::Workflow(_) => {
+            eprintln!("warning: 'workflow' is deprecated; use 'delivery', or 'config validate'")
         }
-        Command::Workflow(WorkflowCommand::ValidateContract { file, parent_file }) => {
+        Command::Config { command: None } => {
+            eprintln!("warning: bare 'config' is deprecated; use 'config show'")
+        }
+        _ => {}
+    }
+    match &cli.command {
+        Command::Capabilities => {
+            return finish(Ok(capabilities()));
+        }
+        Command::Delivery(DeliveryCommand::ValidateContract { file, parent_file })
+        | Command::Workflow(DeliveryCommand::ValidateContract { file, parent_file }) => {
             let result = (|| {
                 let c = input::<issueflow::branch_contract::BranchContract>(file)?;
                 let parent = parent_file
@@ -759,7 +848,15 @@ async fn main() -> ExitCode {
             })();
             return finish(result);
         }
-        Command::Workflow(WorkflowCommand::Validate { file }) => {
+        Command::Config {
+            command: Some(ConfigCommand::Validate { file }),
+        } => {
+            return finish(
+                input::<issueflow::workflow_config::WorkflowConfig>(file)
+                    .and_then(|v| v.validate()),
+            );
+        }
+        Command::Workflow(DeliveryCommand::Validate { file }) => {
             return finish(
                 input::<issueflow::workflow_config::WorkflowConfig>(file)
                     .and_then(|v| v.validate()),
