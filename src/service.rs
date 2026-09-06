@@ -231,6 +231,11 @@ impl Service<'_> {
                 "issue_type is supported only for GitLab issue creation",
             ));
         }
+        let expected_reuse_type = if self.gh() {
+            None
+        } else {
+            Some(requested_type.unwrap_or("issue"))
+        };
         if input.body.contains("issueflow-operation:") {
             return Err(Error::new(
                 "input",
@@ -259,8 +264,9 @@ impl Service<'_> {
                 .unwrap_or("");
             if issue["title"].as_str() != Some(input.title.as_str())
                 || old_body.replace(&marker, "").trim_end() != input.body.trim_end()
-                || requested_type
-                    .is_some_and(|expected| native_issue_type(issue).as_deref() != Some(expected))
+                || expected_reuse_type.is_some_and(|expected| {
+                    native_issue_type(issue).as_deref().unwrap_or("issue") != expected
+                })
             {
                 return Err(Error::new(
                     "conflict",

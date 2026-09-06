@@ -328,6 +328,36 @@ async fn gitlab_idempotency_rejects_an_existing_operation_with_wrong_type() {
 }
 
 #[tokio::test]
+async fn gitlab_idempotency_treats_an_omitted_type_as_issue() {
+    let op = "550e8400-e29b-41d4-a716-446655440005";
+    let mut existing = issue(Platform::Gitlab, &[]);
+    existing["description"] = json!(format!("body\n\n<!-- issueflow-operation: {op} -->"));
+    existing["issue_type"] = json!("task");
+    let mock = Mock::new(vec![step(
+        Method::GET,
+        "projects/group%2Fsub%2Frepo/issues?state=all&scope=all&order_by=created_at&sort=asc&per_page=100&page=1",
+        None,
+        json!([existing]),
+    )]);
+    let error = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .create(
+        CreateInput {
+            title: "test".into(),
+            body: "body".into(),
+            labels: vec![],
+            issue_type: None,
+        },
+        op,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "conflict");
+}
+
+#[tokio::test]
 async fn existing_operation_does_not_post_again() {
     let op = "550e8400-e29b-41d4-a716-446655440000";
     let mut existing = issue(Platform::Github, &[]);
