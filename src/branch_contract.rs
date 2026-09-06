@@ -10,7 +10,10 @@ fn config_for_url(value: &str) -> Result<Config> {
     let parsed = url::Url::parse(value)
         .map_err(|_| Error::new("input", "Invalid issue URL in branch contract"))?;
     let mut environment = HashMap::new();
-    if value.contains("/-/issues/") || value.contains("/-/merge_requests/") {
+    if value.contains("/-/issues/")
+        || value.contains("/-/work_items/")
+        || value.contains("/-/merge_requests/")
+    {
         environment.insert(
             "ISSUEFLOW_GITLAB_URL".into(),
             parsed.origin().ascii_serialization(),
