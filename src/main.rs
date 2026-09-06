@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, process::ExitCode};
+use std::{collections::HashMap, io::IsTerminal, path::PathBuf, process::ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use issueflow::config::{Config, Overrides, read_env_file};
@@ -14,6 +14,12 @@ use std::io::Read;
 #[derive(Parser)]
 #[command(version, about = "GitHub / GitLab issue maintenance CLI")]
 struct Cli {
+    /// Show additional safe diagnostic detail in human-readable output
+    #[arg(long, global = true)]
+    verbose: bool,
+    /// Always emit deterministic JSON, including in an interactive terminal
+    #[arg(long, global = true)]
+    json: bool,
     /// Read this env file instead of .env in the current directory
     #[arg(long, global = true, conflicts_with = "no_env_file")]
     env_file: Option<PathBuf>,
@@ -137,17 +143,31 @@ struct RecoveryArgs {
 fn command_schema(c: &clap::Command) -> Value {
     json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
 }
-fn finish(result: Result<Value>) -> ExitCode {
+#[derive(Clone, Copy)]
+struct OutputOptions {
+    json: bool,
+    verbose: bool,
+}
+
+fn finish(result: Result<Value>, options: OutputOptions) -> ExitCode {
     match result {
         Ok(v) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&v).expect("JSON serialization")
-            );
+            if issueflow::output::use_json(options.json, std::io::stdout().is_terminal()) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v).expect("JSON serialization")
+                );
+            } else {
+                println!("{}", issueflow::output::render_success(&v, options.verbose));
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{}", json!({"error":e}));
+            if issueflow::output::use_json(options.json, std::io::stderr().is_terminal()) {
+                eprintln!("{}", json!({"error":e}));
+            } else {
+                eprintln!("{}", issueflow::output::render_error(&e, options.verbose));
+            }
             ExitCode::from(e.exit_code())
         }
     }
@@ -742,11 +762,18 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let output = OutputOptions {
+        json: cli.json,
+        verbose: cli.verbose,
+    };
     match &cli.command {
         Command::Capabilities => {
-            return finish(Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
-            ));
+            return finish(
+                Ok(
+                    json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
+                ),
+                output,
+            );
         }
         Command::Workflow(WorkflowCommand::ValidateContract { file, parent_file }) => {
             let result = (|| {
@@ -757,12 +784,13 @@ async fn main() -> ExitCode {
                     .transpose()?;
                 c.validate(parent.as_ref())
             })();
-            return finish(result);
+            return finish(result, output);
         }
         Command::Workflow(WorkflowCommand::Validate { file }) => {
             return finish(
                 input::<issueflow::workflow_config::WorkflowConfig>(file)
                     .and_then(|v| v.validate()),
+                output,
             );
         }
         _ => {}
@@ -800,17 +828,5 @@ async fn main() -> ExitCode {
         Ok(config) => execute(cli.command, config).await,
         Err(error) => Err(Error::from(error)),
     };
-    match result {
-        Ok(value) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).expect("JSON value serialization")
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{}", serde_json::json!({"error": error}));
-            ExitCode::from(error.exit_code())
-        }
-    }
+    finish(result, output)
 }
