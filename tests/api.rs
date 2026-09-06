@@ -96,6 +96,17 @@ fn links_override_default_repo_but_reject_foreign_hosts_and_prs() {
         t.endpoint().unwrap(),
         "projects/group%2Fsub%2Frepo/issues/42"
     );
+    let task = Target::from_url(
+        &config,
+        "https://gitlab.example/tools/group/sub/repo/-/work_items/43",
+    )
+    .unwrap();
+    assert_eq!(task.repository, "group/sub/repo");
+    assert_eq!(task.number, Some(43));
+    assert_eq!(
+        task.endpoint().unwrap(),
+        "projects/group%2Fsub%2Frepo/issues/43"
+    );
     for url in [
         "https://evil.test/owner/repo/issues/2",
         "https://github.com/owner/repo/pull/2",
@@ -165,6 +176,7 @@ async fn gitlab_create_maps_body_labels_and_iid() {
                 title: "test".into(),
                 body: "body".into(),
                 labels: vec!["type::bug".into()],
+                issue_type: None,
             },
             op,
         )
@@ -172,6 +184,147 @@ async fn gitlab_create_maps_body_labels_and_iid() {
         .unwrap();
     assert_eq!(result["issue"]["number"], 2);
     assert_eq!(result["issue"]["id"], 99);
+}
+
+#[tokio::test]
+async fn gitlab_create_task_sets_and_verifies_native_type() {
+    let op = "550e8400-e29b-41d4-a716-446655440001";
+    let mut task = issue(Platform::Gitlab, &["type::chore"]);
+    task["issue_type"] = json!("task");
+    task["web_url"] = json!("https://gitlab.example/group/sub/repo/-/work_items/2");
+    let mock = Mock::new(vec![
+        step(
+            Method::GET,
+            "projects/group%2Fsub%2Frepo/issues?state=all&scope=all&order_by=created_at&sort=asc&per_page=100&page=1",
+            None,
+            json!([]),
+        ),
+        step(
+            Method::POST,
+            "projects/group%2Fsub%2Frepo/issues",
+            Some(json!({
+                "title":"test task",
+                "description":format!("body\n\n<!-- issueflow-operation: {op} -->"),
+                "labels":"type::chore",
+                "issue_type":"task"
+            })),
+            task,
+        ),
+    ]);
+    let result = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .create(
+        CreateInput {
+            title: "test task".into(),
+            body: "body".into(),
+            labels: vec!["type::chore".into()],
+            issue_type: Some("task".into()),
+        },
+        op,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result["issue"]["url"],
+        "https://gitlab.example/group/sub/repo/-/work_items/2"
+    );
+    assert_eq!(result["issue"]["issue_type"], "task");
+}
+
+#[tokio::test]
+async fn create_rejects_unsupported_issue_types_before_transport() {
+    for (platform, issue_type) in [(Platform::Github, "task"), (Platform::Gitlab, "incident")] {
+        let mock = Mock::new(vec![]);
+        let error = Service {
+            transport: &mock,
+            target: target(platform),
+        }
+        .create(
+            CreateInput {
+                title: "test".into(),
+                body: "body".into(),
+                labels: vec![],
+                issue_type: Some(issue_type.into()),
+            },
+            "550e8400-e29b-41d4-a716-446655440002",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "input");
+    }
+}
+
+#[tokio::test]
+async fn gitlab_create_task_marks_unconfirmed_type_as_unknown() {
+    let op = "550e8400-e29b-41d4-a716-446655440003";
+    let mock = Mock::new(vec![
+        step(
+            Method::GET,
+            "projects/group%2Fsub%2Frepo/issues?state=all&scope=all&order_by=created_at&sort=asc&per_page=100&page=1",
+            None,
+            json!([]),
+        ),
+        step(
+            Method::POST,
+            "projects/group%2Fsub%2Frepo/issues",
+            Some(json!({
+                "title":"test task",
+                "description":format!("body\n\n<!-- issueflow-operation: {op} -->"),
+                "labels":"",
+                "issue_type":"task"
+            })),
+            issue(Platform::Gitlab, &[]),
+        ),
+    ]);
+    let error = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .create(
+        CreateInput {
+            title: "test task".into(),
+            body: "body".into(),
+            labels: vec![],
+            issue_type: Some("task".into()),
+        },
+        op,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "response");
+    assert!(error.outcome_unknown);
+}
+
+#[tokio::test]
+async fn gitlab_idempotency_rejects_an_existing_operation_with_wrong_type() {
+    let op = "550e8400-e29b-41d4-a716-446655440004";
+    let mut existing = issue(Platform::Gitlab, &[]);
+    existing["description"] = json!(format!("body\n\n<!-- issueflow-operation: {op} -->"));
+    existing["issue_type"] = json!("issue");
+    let mock = Mock::new(vec![step(
+        Method::GET,
+        "projects/group%2Fsub%2Frepo/issues?state=all&scope=all&order_by=created_at&sort=asc&per_page=100&page=1",
+        None,
+        json!([existing]),
+    )]);
+    let error = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .create(
+        CreateInput {
+            title: "test".into(),
+            body: "body".into(),
+            labels: vec![],
+            issue_type: Some("task".into()),
+        },
+        op,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "conflict");
 }
 
 #[tokio::test]
@@ -194,6 +347,7 @@ async fn existing_operation_does_not_post_again() {
             title: "test".into(),
             body: "body".into(),
             labels: vec![],
+            issue_type: None,
         },
         op,
     )

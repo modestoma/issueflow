@@ -60,6 +60,8 @@ pub struct CreateInput {
     pub body: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// GitLab's native issue type. Omit for an ordinary issue.
+    pub issue_type: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -215,6 +217,20 @@ impl Service<'_> {
         }
         validate_labels(&input.labels)?;
         validate_categories(&input.labels)?;
+        let requested_type = match input.issue_type.as_deref() {
+            None => None,
+            Some("issue") => Some("issue"),
+            Some("task") => Some("task"),
+            Some(_) => {
+                return Err(Error::new("input", "issue_type must be issue or task"));
+            }
+        };
+        if self.gh() && requested_type.is_some() {
+            return Err(Error::new(
+                "input",
+                "issue_type is supported only for GitLab issue creation",
+            ));
+        }
         if input.body.contains("issueflow-operation:") {
             return Err(Error::new(
                 "input",
@@ -243,6 +259,8 @@ impl Service<'_> {
                 .unwrap_or("");
             if issue["title"].as_str() != Some(input.title.as_str())
                 || old_body.replace(&marker, "").trim_end() != input.body.trim_end()
+                || requested_type
+                    .is_some_and(|expected| native_issue_type(issue).as_deref() != Some(expected))
             {
                 return Err(Error::new(
                     "conflict",
@@ -261,6 +279,9 @@ impl Service<'_> {
         } else {
             json!(input.labels.join(","))
         };
+        if let Some(issue_type) = requested_type {
+            payload["issue_type"] = json!(issue_type);
+        }
         let response = self
             .transport
             .request(Method::POST, &self.target.collection(), Some(payload))
@@ -269,6 +290,17 @@ impl Service<'_> {
                 e.message.push_str(&format!("；request-id={operation}"));
                 e
             })?;
+        if requested_type
+            .is_some_and(|expected| native_issue_type(&response).as_deref() != Some(expected))
+        {
+            let mut error = Error::new(
+                "response",
+                "GitLab did not confirm the requested issue_type",
+            );
+            error.outcome_unknown = true;
+            error.message.push_str(&format!("；request-id={operation}"));
+            return Err(error);
+        }
         let issue = normalize(&response, self.target.platform).map_err(|mut e| {
             e.outcome_unknown = true;
             e.message.push_str(&format!("；request-id={operation}"));
@@ -785,6 +817,13 @@ impl Service<'_> {
     }
 }
 
+fn native_issue_type(value: &Value) -> Option<String> {
+    value["issue_type"]
+        .as_str()
+        .or_else(|| value["type"].as_str())
+        .map(str::to_ascii_lowercase)
+}
+
 fn target_from_dependency(value: &Value, platform: Platform) -> Result<Target> {
     if platform == Platform::Gitlab
         && let Some(full) = value["references"]["full"].as_str()
@@ -893,7 +932,12 @@ pub fn normalize(value: &Value, platform: Platform) -> Result<Value> {
     let url = value[if gh { "html_url" } else { "web_url" }]
         .as_str()
         .ok_or_else(|| Error::new("response", "API 缺少 issue URL"))?;
+    let issue_type = if gh {
+        "issue".to_string()
+    } else {
+        native_issue_type(value).unwrap_or_else(|| "issue".to_string())
+    };
     Ok(
-        json!({"platform": platform, "id": value["id"], "number": number, "url": url, "title": value["title"], "body": value[if gh { "body" } else { "description" }].as_str().unwrap_or(""), "state": if value["state"] == "closed" { "closed" } else { "open" }, "labels": labels(value)?, "created_at": value["created_at"], "updated_at": value["updated_at"]}),
+        json!({"platform": platform, "id": value["id"], "number": number, "url": url, "title": value["title"], "body": value[if gh { "body" } else { "description" }].as_str().unwrap_or(""), "state": if value["state"] == "closed" { "closed" } else { "open" }, "issue_type": issue_type, "labels": labels(value)?, "created_at": value["created_at"], "updated_at": value["updated_at"]}),
     )
 }

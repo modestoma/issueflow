@@ -77,9 +77,13 @@ impl Target {
         if let Some(base) = &config.gitlab_url
             && url.origin() == base.origin()
             && let Some(path) = url.path().strip_prefix(base.path())
-            && let Some((repo, number)) = path.trim_end_matches('/').rsplit_once("/-/issues/")
         {
-            candidates.push((Platform::Gitlab, repo.to_string(), number.to_string()));
+            let path = path.trim_end_matches('/');
+            for separator in ["/-/issues/", "/-/work_items/"] {
+                if let Some((repo, number)) = path.rsplit_once(separator) {
+                    candidates.push((Platform::Gitlab, repo.to_string(), number.to_string()));
+                }
+            }
         }
         if candidates.len() != 1 {
             return Err(Error::new(
