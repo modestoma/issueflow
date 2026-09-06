@@ -66,7 +66,7 @@ To create a GitLab Task that can become a native child item, set the native type
 
 ```sh
 issueflow --platform gitlab --repository group/repo issue create --file task.json --request-id UUID
-issueflow hierarchy add-child https://gitlab.example.com/group/repo/-/issues/2 https://gitlab.example.com/group/repo/-/work_items/3
+issueflow issue add-sub-issue https://gitlab.example.com/group/repo/-/issues/2 https://gitlab.example.com/group/repo/-/work_items/3
 ```
 
 Creation appends an operation UUID comment to the body. The output includes the operation, native issue number, and URL. Use `--request-id UUID` to explicitly identify the same logical request. A retry scans all visible issues: an existing request ID with matching content reuses the issue, while different content or multiple matches produce a conflict. No local registry file is maintained.
@@ -131,14 +131,15 @@ issueflow --platform gitlab --repository group/repo kanban init 3
 ### Dependencies
 
 ```sh
-issueflow issue dependencies https://github.com/owner/repo/issues/42
+issueflow issue blocked-by https://github.com/owner/repo/issues/42
+issueflow issue blocking https://github.com/owner/repo/issues/42
 issueflow issue add-dependency https://github.com/owner/repo/issues/42 https://github.com/owner/repo/issues/40
 issueflow issue remove-dependency https://github.com/owner/repo/issues/42 https://github.com/owner/repo/issues/40
 ```
 
 The first issue is **blocked by the second issue**. Before adding a dependency, the CLI traverses reachable blockers and checks for cycles, up to 1,000 nodes. GitHub uses the dependencies API; GitLab uses issue links. Dependencies may cross repositories but must remain on the same platform and instance. Unsupported versions or insufficient permissions produce API errors; ordinary related-to links are never presented as blocking relationships. Native GitLab blocking relationships depend on the instance license.
 
-Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent/child hierarchy is independent of blocking and does not automatically authorize work or delivery.
+Both dependency directions retain native relationship data: `blocked-by` lists prerequisites of the current issue and `blocking` lists issues that depend on it. `dependencies` remains a compatibility spelling of `blocked-by`. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent/Sub-issue hierarchy is independent of blocking and does not automatically authorize work or delivery.
 
 ### GitHub Projects
 
@@ -280,16 +281,27 @@ For GitLab, `pr list/show/create/update/ready/checks/merge` use the configured i
 
 Current commands do not evaluate every repository merge policy. Review required checks using available repository evidence or the PR/MR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls), [GitLab Merge Requests API reference](https://docs.gitlab.com/api/merge_requests/).
 
-### Native parent and child hierarchy
+### Native Parent and Sub-issue relationships
 
 ```sh
-issueflow hierarchy parent ISSUE_OR_WORK_ITEM_URL
-issueflow hierarchy children ISSUE_OR_WORK_ITEM_URL
-issueflow hierarchy add-child PARENT_URL CHILD_URL
-issueflow hierarchy remove-child PARENT_URL CHILD_URL
+issueflow issue relationships ISSUE_OR_WORK_ITEM_URL
+issueflow issue parent ISSUE_OR_WORK_ITEM_URL
+issueflow issue sub-issues ISSUE_OR_WORK_ITEM_URL
+issueflow issue sub-issues GITHUB_ISSUE_URL --recursive --depth 8
+issueflow issue add-sub-issue PARENT_URL CHILD_URL
+issueflow issue add-sub-issue NEW_PARENT_URL CHILD_URL --move-from EXPECTED_OLD_PARENT_URL
+issueflow issue remove-sub-issue PARENT_URL CHILD_URL
+issueflow issue remove-parent CHILD_URL
+issueflow issue move-sub-issue PARENT_URL CHILD_URL --before SIBLING_URL
+issueflow issue move-sub-issue PARENT_URL CHILD_URL --after SIBLING_URL
+issueflow --platform github --repository owner/repo issue create --file issue.json --parent PARENT_URL
 ```
 
-GitHub uses native Sub-issues REST endpoints. Adds traverse up to 1,000 descendants before writing to reject cycles, reuse an existing relationship, and read back mutations. GitLab uses the versionless Work Item GraphQL hierarchy widget through the configured instance `/api/graphql` endpoint. The project-level adapter supports the reliable `Issue -> Task` combination only: create the Task with GitLab `issue_type: "task"`, then use its returned `/work_items/` URL. Both items must be distinct and in the same project, their native Work Item types are read before mutation, an existing different parent causes a conflict, and `workItemUpdate.hierarchyWidget.parentId` is verified by rereading the child. Arbitrary `Issue -> Issue`, group Epic mapping, and hierarchy reordering are not claimed; an unsupported hierarchy may retain an explicitly documented logical delivery contract, but is never presented as a native Child item. Native hierarchy never implies a blocking dependency; keep branch contracts and blocking links explicit. [GitHub Sub-issues API](https://docs.github.com/en/rest/issues/sub-issues), [GitLab child items](https://docs.gitlab.com/user/work_items/child_items/), and [GitLab Issues API](https://docs.gitlab.com/api/issues/).
+`relationships` returns separate `parent`, ordered `sub_issues`, informational `sub_issues_summary`, `blocked_by`, and `blocking` values; it never infers one relationship kind from another. Direct Sub-issue reads are the inexpensive default. GitHub recursive reads are bounded to eight levels and 1,000 returned items, preserve native ids, URLs, state, depth, parent URL, and sibling position, and reject repeated nodes or more than 100 direct children instead of presenting partial data.
+
+GitHub uses native Sub-issues REST endpoints. Adds traverse up to 1,000 descendants before writing to reject cycles and read back mutations. An existing different parent is rejected unless `--move-from` exactly matches the current parent; explicit reassignment verifies the child under the new parent and absent from the old parent. Create-with-parent sends GitHub's native parent field as part of the create request, and both ordinary idempotent reuse and `recover-create --parent PARENT_URL` verify the actual parent. Sibling ordering requires exactly one `--before` or `--after`, validates both items against the requested parent before writing, and reads back their final adjacency.
+
+GitLab uses the versionless Work Item GraphQL hierarchy widget through the configured instance `/api/graphql` endpoint. The project-level adapter supports the reliable `Issue -> Task` combination only: create the Task with GitLab `issue_type: "task"`, then use its returned `/work_items/` URL. Both items must be distinct and in the same project, their native Work Item types are read before mutation, an existing different parent causes a conflict, and `workItemUpdate.hierarchyWidget.parentId` is verified by rereading the child. Recursive traversal, explicit reassignment, create-with-parent, arbitrary `Issue -> Issue`, group Epic mapping, and hierarchy reordering are not claimed for GitLab and fail before mutation. Native hierarchy and progress never imply a blocking dependency, Project transition, closure, or delivery acceptance. The hidden `hierarchy parent/children/add-child/remove-child` aliases remain for one compatibility release and warn on stderr. [GitHub Sub-issues API](https://docs.github.com/en/rest/issues/sub-issues), [GitHub issue dependencies API](https://docs.github.com/en/rest/issues/issue-dependencies), [GitLab child items](https://docs.gitlab.com/user/work_items/child_items/), and [GitLab Issues API](https://docs.gitlab.com/api/issues/).
 
 ### Validate parent/child branch contracts
 

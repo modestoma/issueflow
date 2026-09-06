@@ -148,6 +148,158 @@ async fn list_fetches_closed_and_all_pages_excluding_prs() {
 }
 
 #[tokio::test]
+async fn github_reads_both_dependency_directions_without_conflating_them() {
+    let blocker = json!({"id":30,"number":3,"html_url":"https://github.com/owner/repo/issues/3"});
+    let blocked = json!({"id":40,"number":4,"html_url":"https://github.com/owner/repo/issues/4"});
+    let mock = Mock::new(vec![
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/2",
+            None,
+            issue(Platform::Github, &[]),
+        ),
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/2/dependencies/blocked_by?per_page=100&page=1",
+            None,
+            json!([blocker.clone()]),
+        ),
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/2",
+            None,
+            issue(Platform::Github, &[]),
+        ),
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/2/dependencies/blocking?per_page=100&page=1",
+            None,
+            json!([blocked.clone()]),
+        ),
+    ]);
+    let service = Service {
+        transport: &mock,
+        target: target(Platform::Github),
+    };
+    assert_eq!(service.blocked_by().await.unwrap(), json!([blocker]));
+    assert_eq!(service.blocking().await.unwrap(), json!([blocked]));
+}
+
+#[tokio::test]
+async fn github_create_with_parent_uses_native_field_and_verifies_parent() {
+    let op = "550e8400-e29b-41d4-a716-446655440000";
+    let mut parent_issue = issue(Platform::Github, &[]);
+    parent_issue["id"] = json!(90);
+    parent_issue["number"] = json!(9);
+    parent_issue["html_url"] = json!("https://github.com/owner/repo/issues/9");
+    let mut child = issue(Platform::Github, &[]);
+    child["id"] = json!(30);
+    child["number"] = json!(3);
+    child["html_url"] = json!("https://github.com/owner/repo/issues/3");
+    child["body"] = json!(format!("body\n\n<!-- issueflow-operation: {op} -->"));
+    let mock = Mock::new(vec![
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/9",
+            None,
+            parent_issue.clone(),
+        ),
+        step(
+            Method::GET,
+            "repos/owner/repo/issues?state=all&sort=created&direction=asc&per_page=100&page=1",
+            None,
+            json!([]),
+        ),
+        step(
+            Method::POST,
+            "repos/owner/repo/issues",
+            Some(json!({
+                "title":"child",
+                "body":format!("body\n\n<!-- issueflow-operation: {op} -->"),
+                "labels":[],
+                "parent_issue_id":90
+            })),
+            child,
+        ),
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/3/parent",
+            None,
+            parent_issue,
+        ),
+    ]);
+    let parent = Target {
+        platform: Platform::Github,
+        repository: "owner/repo".into(),
+        number: Some(9),
+    };
+    let result = Service {
+        transport: &mock,
+        target: Target {
+            number: None,
+            ..target(Platform::Github)
+        },
+    }
+    .create_with_parent(
+        CreateInput {
+            title: "child".into(),
+            body: "body".into(),
+            labels: vec![],
+            issue_type: None,
+        },
+        op,
+        Some(&parent),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["issue"]["number"], 3);
+}
+
+#[tokio::test]
+async fn github_recover_create_with_parent_verifies_native_relationship() {
+    let op = "550e8400-e29b-41d4-a716-446655440000";
+    let mut child = issue(Platform::Github, &[]);
+    child["id"] = json!(30);
+    child["number"] = json!(3);
+    child["html_url"] = json!("https://github.com/owner/repo/issues/3");
+    child["body"] = json!(format!("body\n\n<!-- issueflow-operation: {op} -->"));
+    let mut parent_issue = issue(Platform::Github, &[]);
+    parent_issue["id"] = json!(90);
+    parent_issue["number"] = json!(9);
+    parent_issue["html_url"] = json!("https://github.com/owner/repo/issues/9");
+    let mock = Mock::new(vec![
+        step(
+            Method::GET,
+            "repos/owner/repo/issues?state=all&sort=created&direction=asc&per_page=100&page=1",
+            None,
+            json!([child]),
+        ),
+        step(
+            Method::GET,
+            "repos/owner/repo/issues/3/parent",
+            None,
+            parent_issue,
+        ),
+    ]);
+    let parent = Target {
+        platform: Platform::Github,
+        repository: "owner/repo".into(),
+        number: Some(9),
+    };
+    let result = Service {
+        transport: &mock,
+        target: Target {
+            number: None,
+            ..target(Platform::Github)
+        },
+    }
+    .recover_create_with_parent(op, Some(&parent))
+    .await
+    .unwrap();
+    assert_eq!(result["status"], "found");
+}
+
+#[tokio::test]
 async fn gitlab_create_maps_body_labels_and_iid() {
     let op = "550e8400-e29b-41d4-a716-446655440000";
     let mock = Mock::new(vec![

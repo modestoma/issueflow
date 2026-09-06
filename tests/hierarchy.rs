@@ -77,11 +77,13 @@ async fn add_child_checks_cycles_writes_once_and_reads_back() {
     let mock = Mock {
         replies: Mutex::new(
             vec![
+                Value::Null,
                 json!([]),
                 child.clone(),
                 json!([]),
                 json!({}),
                 json!([child]),
+                issue(2, 20),
             ]
             .into(),
         ),
@@ -130,7 +132,7 @@ async fn github_remove_child_writes_once_and_reads_back() {
 async fn github_existing_and_missing_relationships_are_noops() {
     let child = issue(3, 30);
     let add_mock = Mock {
-        replies: Mutex::new(vec![json!([]), child.clone(), json!([child.clone()])].into()),
+        replies: Mutex::new(vec![issue(2, 20), json!([child.clone()])].into()),
         calls: Mutex::new(vec![]),
     };
     assert_eq!(
@@ -178,7 +180,7 @@ async fn github_existing_and_missing_relationships_are_noops() {
 #[tokio::test]
 async fn cycle_is_rejected_before_write() {
     let mock = Mock {
-        replies: Mutex::new(vec![json!([issue(2, 20)])].into()),
+        replies: Mutex::new(vec![Value::Null, json!([issue(2, 20)])].into()),
         calls: Mutex::new(vec![]),
     };
     let error = Hierarchy {
@@ -196,6 +198,236 @@ async fn cycle_is_rejected_before_write() {
             .iter()
             .all(|(method, _, _)| *method == Method::GET)
     );
+}
+
+#[tokio::test]
+async fn recursive_sub_issues_preserve_depth_position_and_cross_repository_urls() {
+    let mut cross_repo = issue(4, 40);
+    cross_repo["html_url"] = json!("https://github.com/owner/other/issues/4");
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                json!([issue(3, 30), cross_repo]),
+                json!([issue(5, 50)]),
+                json!([]),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .sub_issues(true, Some(2))
+    .await
+    .unwrap();
+    assert_eq!(result[0]["depth"], 1);
+    assert_eq!(result[0]["position"], 1);
+    assert_eq!(result[1]["depth"], 2);
+    assert_eq!(result[1]["parent_url"], issue(3, 30)["html_url"]);
+    assert_eq!(result[2]["url"], "https://github.com/owner/other/issues/4");
+    assert_eq!(
+        mock.calls.lock().unwrap()[2].1,
+        "repos/owner/other/issues/4/sub_issues?per_page=100&page=1"
+    );
+}
+
+#[tokio::test]
+async fn recursive_sub_issues_reject_invalid_depth_and_repeated_nodes() {
+    let no_calls = Mock {
+        replies: Mutex::new(vec![].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Hierarchy {
+        transport: &no_calls,
+        parent: target(2),
+    }
+    .sub_issues(true, Some(0))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "input");
+
+    let repeated = Mock {
+        replies: Mutex::new(vec![json!([issue(3, 30)]), json!([issue(3, 30)])].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Hierarchy {
+        transport: &repeated,
+        parent: target(2),
+    }
+    .sub_issues(true, Some(8))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "conflict");
+}
+
+#[tokio::test]
+async fn more_than_100_direct_sub_issues_is_never_partial_success() {
+    let first_page = (1..=100)
+        .map(|number| issue(number, number + 1000))
+        .collect::<Vec<_>>();
+    let mock = Mock {
+        replies: Mutex::new(vec![json!(first_page), json!([issue(101, 1101)])].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .children()
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "conflict");
+}
+
+#[tokio::test]
+async fn explicit_reparenting_verifies_new_and_old_parents() {
+    let child = issue(3, 30);
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                issue(1, 10),
+                json!([]),
+                child.clone(),
+                json!([]),
+                json!({}),
+                json!([child]),
+                issue(2, 20),
+                json!([]),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .add_child_with_move(&target(3), Some(&target(1)))
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["parent"]["number"], 2);
+}
+
+#[tokio::test]
+async fn adding_child_with_wrong_expected_parent_stops_before_write() {
+    let mock = Mock {
+        replies: Mutex::new(vec![issue(1, 10)].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .add_child_with_move(&target(3), Some(&target(9)))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "conflict");
+    assert!(
+        mock.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+}
+
+#[tokio::test]
+async fn remove_parent_without_parent_is_a_noop() {
+    let mock = Mock {
+        replies: Mutex::new(vec![Value::Null].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: target(3),
+    }
+    .remove_parent()
+    .await
+    .unwrap();
+    assert_eq!(result, json!({"changed":false,"parent":Value::Null}));
+}
+
+#[tokio::test]
+async fn move_child_writes_exact_native_order_and_reads_back() {
+    let child = issue(3, 30);
+    let sibling = issue(4, 40);
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                json!([child.clone(), sibling.clone()]),
+                json!({}),
+                json!([sibling, child]),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .move_child(&target(3), None, Some(&target(4)))
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls[1].0, Method::PATCH);
+    assert_eq!(calls[1].1, "repos/owner/repo/issues/2/sub_issues/priority");
+    assert_eq!(calls[1].2, Some(json!({"sub_issue_id":30,"after_id":40})));
+}
+
+#[tokio::test]
+async fn relationships_keep_hierarchy_and_dependency_directions_separate() {
+    let mut closed = issue(4, 40);
+    closed["state"] = json!("closed");
+    let blocker = issue(5, 50);
+    let blocked = issue(6, 60);
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                issue(1, 10),
+                json!([issue(3, 30), closed]),
+                issue(2, 20),
+                json!([blocker]),
+                issue(2, 20),
+                json!([blocked]),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Hierarchy {
+        transport: &mock,
+        parent: target(2),
+    }
+    .relationships()
+    .await
+    .unwrap();
+    assert_eq!(result["parent"]["number"], 1);
+    assert_eq!(result["sub_issues_summary"]["completed"], 1);
+    assert_eq!(result["sub_issues_summary"]["total"], 2);
+    assert_eq!(result["blocked_by"][0]["number"], 5);
+    assert_eq!(result["blocking"][0]["number"], 6);
+}
+
+#[tokio::test]
+async fn gitlab_ordering_is_rejected_before_transport() {
+    let mock = Mock {
+        replies: Mutex::new(vec![].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Hierarchy {
+        transport: &mock,
+        parent: gitlab_target(2),
+    }
+    .move_child(&gitlab_target(3), Some(&gitlab_target(4)), None)
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "input");
+    assert!(mock.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

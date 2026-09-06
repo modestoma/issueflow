@@ -37,7 +37,7 @@ enum Command {
     /// Show installed GitHub and GitLab support; does not inspect configuration or permissions
     Capabilities,
     /// Read and maintain native parent/child relationships
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Hierarchy(HierarchyCommand),
     /// Read and initialize GitLab project issue boards
     #[command(subcommand, hide = true)]
@@ -430,6 +430,9 @@ enum IssueCommand {
     RecoverCreate {
         #[arg(long)]
         request_id: String,
+        /// Verify that the recovered GitHub issue belongs to this parent
+        #[arg(long)]
+        parent: Option<String>,
     },
     /// Preview or apply canonical GitLab workflow metadata migration
     ReconcileMetadata {
@@ -453,6 +456,9 @@ enum IssueCommand {
         file: PathBuf,
         #[arg(long)]
         request_id: Option<String>,
+        /// Create a native GitHub Sub-issue under this parent
+        #[arg(long)]
+        parent: Option<String>,
     },
     /// Update title/body from JSON, optionally checking the last update time
     Update {
@@ -497,7 +503,47 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// List native blocking dependencies
+    /// Read the native parent issue
+    Parent { url: String },
+    /// List native Sub-issues, optionally traversing a bounded tree
+    SubIssues {
+        url: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long, requires = "recursive", value_parser = clap::value_parser!(u8).range(1..=8))]
+        depth: Option<u8>,
+    },
+    /// Read parent, Sub-issues and both dependency directions
+    Relationships { url: String },
+    /// Add an existing native Sub-issue
+    AddSubIssue {
+        parent_url: String,
+        child_url: String,
+        #[arg(long)]
+        move_from: Option<String>,
+    },
+    /// Remove a native Sub-issue from the requested parent
+    RemoveSubIssue {
+        parent_url: String,
+        child_url: String,
+    },
+    /// Remove the current native parent; no parent is a no-op
+    RemoveParent { url: String },
+    /// Reprioritize a GitHub Sub-issue relative to one sibling
+    MoveSubIssue {
+        parent_url: String,
+        child_url: String,
+        #[arg(long, conflicts_with = "after", required_unless_present = "after")]
+        before: Option<String>,
+        #[arg(long, conflicts_with = "before", required_unless_present = "before")]
+        after: Option<String>,
+    },
+    /// List issues that block this issue
+    BlockedBy { url: String },
+    /// List issues that this issue blocks
+    Blocking { url: String },
+    /// Deprecated spelling of blocked-by
+    #[command(hide = true)]
     Dependencies { url: String },
     /// Mark the first issue as blocked by the second, checking for cycles
     AddDependency { url: String, blocker_url: String },
@@ -518,9 +564,18 @@ impl IssueCommand {
             | Self::Transition { url, .. }
             | Self::Close { url, .. }
             | Self::Reopen { url, .. }
+            | Self::Parent { url }
+            | Self::SubIssues { url, .. }
+            | Self::Relationships { url }
+            | Self::RemoveParent { url }
+            | Self::BlockedBy { url }
+            | Self::Blocking { url }
             | Self::Dependencies { url }
             | Self::AddDependency { url, .. }
             | Self::RemoveDependency { url, .. } => Some(url),
+            Self::AddSubIssue { parent_url, .. }
+            | Self::RemoveSubIssue { parent_url, .. }
+            | Self::MoveSubIssue { parent_url, .. } => Some(parent_url),
         }
     }
 }
@@ -577,6 +632,9 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         .await;
     }
     if let Command::Hierarchy(command) = command {
+        eprintln!(
+            "warning: `hierarchy` is deprecated; use the corresponding `issue` Sub-issue command"
+        );
         let parent_url = match &command {
             HierarchyCommand::Parent { issue_url } | HierarchyCommand::Children { issue_url } => {
                 issue_url
@@ -1115,7 +1173,15 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         Command::SetupLabels => service.setup_labels().await,
         Command::Issue(command) => match command {
             IssueCommand::List => service.list().await,
-            IssueCommand::RecoverCreate { request_id } => service.recover_create(&request_id).await,
+            IssueCommand::RecoverCreate { request_id, parent } => {
+                let parent = parent
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                service
+                    .recover_create_with_parent(&request_id, parent.as_ref())
+                    .await
+            }
             IssueCommand::ReconcileMetadata { apply, .. } => {
                 service.reconcile_metadata(apply).await
             }
@@ -1128,11 +1194,20 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 }
             }
             IssueCommand::Comments { .. } => service.comments().await,
-            IssueCommand::Create { file, request_id } => {
+            IssueCommand::Create {
+                file,
+                request_id,
+                parent,
+            } => {
+                let parent = parent
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
                 service
-                    .create(
+                    .create_with_parent(
                         input(&file)?,
                         &request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        parent.as_ref(),
                     )
                     .await
             }
@@ -1168,7 +1243,92 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                     service.reopen().await
                 }
             }
-            IssueCommand::Dependencies { .. } => service.dependencies().await,
+            IssueCommand::Parent { .. } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .parent()
+                .await
+            }
+            IssueCommand::SubIssues {
+                recursive, depth, ..
+            } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .sub_issues(recursive, depth)
+                .await
+            }
+            IssueCommand::Relationships { .. } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .relationships()
+                .await
+            }
+            IssueCommand::AddSubIssue {
+                child_url,
+                move_from,
+                ..
+            } => {
+                let child = issueflow::hierarchy::target_from_url(&config, &child_url)?;
+                let old_parent = move_from
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .add_child_with_move(&child, old_parent.as_ref())
+                .await
+            }
+            IssueCommand::RemoveSubIssue { child_url, .. } => {
+                let child = issueflow::hierarchy::target_from_url(&config, &child_url)?;
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .remove_child(&child)
+                .await
+            }
+            IssueCommand::RemoveParent { .. } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .remove_parent()
+                .await
+            }
+            IssueCommand::MoveSubIssue {
+                child_url,
+                before,
+                after,
+                ..
+            } => {
+                let child = issueflow::hierarchy::target_from_url(&config, &child_url)?;
+                let before = before
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                let after = after
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .move_child(&child, before.as_ref(), after.as_ref())
+                .await
+            }
+            IssueCommand::BlockedBy { .. } | IssueCommand::Dependencies { .. } => {
+                service.blocked_by().await
+            }
+            IssueCommand::Blocking { .. } => service.blocking().await,
             IssueCommand::AddDependency { blocker_url, .. } => {
                 service
                     .add_dependency(&Target::from_url(&config, &blocker_url)?)
