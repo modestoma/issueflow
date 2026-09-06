@@ -180,6 +180,13 @@ impl Service<'_> {
     }
     /// Inspect a prior create operation without ever submitting another create request.
     pub async fn recover_create(&self, operation: &str) -> Result<Value> {
+        self.recover_create_with_parent(operation, None).await
+    }
+    pub async fn recover_create_with_parent(
+        &self,
+        operation: &str,
+        expected_parent: Option<&Target>,
+    ) -> Result<Value> {
         let id = uuid::Uuid::parse_str(operation)
             .map_err(|_| Error::new("input", "request-id must be a UUID"))?;
         let issues = self.raw_list().await?;
@@ -200,6 +207,17 @@ impl Service<'_> {
             })
             .map(|v| normalize(v, self.target.platform))
             .collect::<Result<Vec<_>>>()?;
+        if let Some(parent) = expected_parent {
+            if !self.gh() || parent.platform != Platform::Github {
+                return Err(Error::new(
+                    "input",
+                    "create recovery with --parent is supported only for GitHub",
+                ));
+            }
+            if let [issue] = matches.as_slice() {
+                self.verify_github_parent(issue, parent, false).await?;
+            }
+        }
         let status = match matches.len() {
             0 => "not_visible",
             1 => "found",
@@ -209,7 +227,15 @@ impl Service<'_> {
             json!({"operation":id.to_string(),"status":status,"matches":matches,"safe_to_retry":false,"note":"Read-only inspection. No match does not prove the create failed; visibility may lag. Do not retry create to verify its outcome."}),
         )
     }
-    pub async fn create(&self, mut input: CreateInput, operation: &str) -> Result<Value> {
+    pub async fn create(&self, input: CreateInput, operation: &str) -> Result<Value> {
+        self.create_with_parent(input, operation, None).await
+    }
+    pub async fn create_with_parent(
+        &self,
+        mut input: CreateInput,
+        operation: &str,
+        parent: Option<&Target>,
+    ) -> Result<Value> {
         uuid::Uuid::parse_str(operation)
             .map_err(|_| Error::new("input", "request-id 必须为 UUID"))?;
         if input.title.trim().is_empty() {
@@ -231,6 +257,27 @@ impl Service<'_> {
                 "issue_type is supported only for GitLab issue creation",
             ));
         }
+        let parent_id = if let Some(parent) = parent {
+            if !self.gh() || parent.platform != Platform::Github {
+                return Err(Error::new(
+                    "input",
+                    "issue create --parent is supported only for GitHub",
+                ));
+            }
+            let parent_issue = Service {
+                transport: self.transport,
+                target: parent.clone(),
+            }
+            .raw_issue()
+            .await?;
+            Some(
+                parent_issue["id"]
+                    .as_u64()
+                    .ok_or_else(|| Error::new("response", "Parent issue has no native id"))?,
+            )
+        } else {
+            None
+        };
         let expected_reuse_type = if self.gh() {
             None
         } else {
@@ -273,6 +320,9 @@ impl Service<'_> {
                     "request-id 已存在，但标题或正文不同；未覆盖已有 issue",
                 ));
             }
+            if let Some(parent) = parent {
+                self.verify_github_parent(issue, parent, false).await?;
+            }
             return Ok(
                 json!({"operation": operation, "reused": true, "issue": normalize(issue, self.target.platform)?}),
             );
@@ -287,6 +337,9 @@ impl Service<'_> {
         };
         if let Some(issue_type) = requested_type {
             payload["issue_type"] = json!(issue_type);
+        }
+        if let Some(parent_id) = parent_id {
+            payload["parent_issue_id"] = json!(parent_id);
         }
         let response = self
             .transport
@@ -312,7 +365,54 @@ impl Service<'_> {
             e.message.push_str(&format!("；request-id={operation}"));
             e
         })?;
+        if let Some(parent) = parent {
+            self.verify_github_parent(&response, parent, true)
+                .await
+                .map_err(|mut error| {
+                    error.message.push_str(&format!("; request-id={operation}"));
+                    error
+                })?;
+        }
         Ok(json!({"operation": operation, "reused": false, "issue": issue}))
+    }
+
+    async fn verify_github_parent(
+        &self,
+        issue: &Value,
+        expected_parent: &Target,
+        unknown_outcome: bool,
+    ) -> Result<()> {
+        let child = crate::hierarchy::github_target_from_item(issue).map_err(|mut error| {
+            error.outcome_unknown |= unknown_outcome;
+            error
+        })?;
+        let actual = crate::hierarchy::Hierarchy {
+            transport: self.transport,
+            parent: child,
+        }
+        .parent()
+        .await
+        .map_err(|mut error| {
+            error.outcome_unknown |= unknown_outcome;
+            error
+        })?;
+        let matches = if actual.is_null() {
+            false
+        } else {
+            crate::hierarchy::github_target_from_item(&actual).map_err(|mut error| {
+                error.outcome_unknown |= unknown_outcome;
+                error
+            })? == *expected_parent
+        };
+        if !matches {
+            let mut error = Error::new(
+                "conflict",
+                "Created or recovered issue does not belong to the expected parent",
+            );
+            error.outcome_unknown = unknown_outcome;
+            return Err(error);
+        }
+        Ok(())
     }
     pub async fn update(&self, input: UpdateInput, expected: Option<&str>) -> Result<Value> {
         if input.title.is_none() && input.body.is_none() {
@@ -691,9 +791,22 @@ impl Service<'_> {
         Ok(json!({"created": created}))
     }
     pub async fn dependencies(&self) -> Result<Value> {
+        self.blocked_by().await
+    }
+    pub async fn blocked_by(&self) -> Result<Value> {
+        self.dependency_direction(false).await
+    }
+    pub async fn blocking(&self) -> Result<Value> {
+        self.dependency_direction(true).await
+    }
+    async fn dependency_direction(&self, blocking: bool) -> Result<Value> {
         let current = self.raw_issue().await?;
         let suffix = if self.gh() {
-            "dependencies/blocked_by"
+            if blocking {
+                "dependencies/blocking"
+            } else {
+                "dependencies/blocked_by"
+            }
         } else {
             "links"
         };
@@ -720,7 +833,14 @@ impl Service<'_> {
         Ok(json!(
             items
                 .into_iter()
-                .filter(|v| self.gh() || v["link_type"] == "is_blocked_by")
+                .filter(|v| {
+                    self.gh()
+                        || if blocking {
+                            v["link_type"] == "blocks"
+                        } else {
+                            v["link_type"] == "is_blocked_by"
+                        }
+                })
                 .collect::<Vec<_>>()
         ))
     }

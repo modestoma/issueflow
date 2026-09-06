@@ -71,6 +71,11 @@ fn capabilities_ignore_bad_environment() {
         .unwrap();
     assert!(r.status.success());
     let v: Value = serde_json::from_slice(&r.stdout).unwrap();
-    assert_eq!(v["capability_schema_version"], 1);
-    assert!(v.to_string().contains("workflow"));
+    assert_eq!(v["capability_schema_version"], 2);
+    assert_eq!(v["scope"], "installed_support");
+    assert_eq!(v["remote_permissions_checked"], false);
+    assert_eq!(v["platforms"]["github"]["kanban"], "GitHub Projects v2");
+    assert_eq!(v["platforms"]["gitlab"]["kanban"], "GitLab Issue Boards");
+    assert!(v.to_string().contains("delivery"));
+    assert!(!v.to_string().contains("unique-secret"));
 }

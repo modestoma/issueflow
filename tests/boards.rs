@@ -100,6 +100,58 @@ async fn list_and_show_use_nested_project_path() {
 }
 
 #[tokio::test]
+async fn create_reuses_a_unique_named_board_without_writing() {
+    let board = json!({"id":3,"name":"Delivery","lists":[]});
+    let mock = Mock {
+        replies: Mutex::new(vec![json!([board.clone()]), board].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .create("Delivery")
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], false);
+    assert_eq!(result["board"]["id"], 3);
+    assert!(
+        mock.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+}
+
+#[tokio::test]
+async fn create_writes_once_and_reads_the_new_board_back() {
+    let board = json!({"id":3,"name":"Delivery","lists":[]});
+    let mock = Mock {
+        replies: Mutex::new(vec![json!([]), json!({"id":3}), board].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .create("Delivery")
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["board"]["name"], "Delivery");
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .count(),
+        1
+    );
+    assert_eq!(calls[1].2.as_ref().unwrap()["name"], "Delivery");
+}
+
+#[tokio::test]
 async fn repeated_workflow_initialization_is_a_read_only_noop() {
     let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
     let mock = Mock {
@@ -133,6 +185,56 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
             .iter()
             .all(|(method, _, _)| *method == Method::GET)
     );
+}
+
+#[tokio::test]
+async fn targeted_workflow_initialization_uses_the_explicit_board_id() {
+    let board = json!({"id":9,"name":"Team Board","lists":lists()});
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                board.clone(),
+                labels(),
+                labels(),
+                lists(),
+                lists(),
+                board,
+                lists(),
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow_target("ignored for an explicit board", Some(9))
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], false);
+    assert_eq!(result["board"]["id"], 9);
+    assert!(mock.calls.lock().unwrap()[0].1.ends_with("/boards/9"));
+}
+
+#[tokio::test]
+async fn invalid_explicit_board_stops_before_label_writes() {
+    let mock = Mock {
+        replies: Mutex::new(vec![json!({"message":"not found"})].into()),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow_target("ignored", Some(9))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "response");
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, Method::GET);
+    assert!(calls[0].1.ends_with("/boards/9"));
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, process::ExitCode};
+use std::{collections::HashMap, io::IsTerminal, path::PathBuf, process::ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use issueflow::config::{Config, Overrides, read_env_file};
@@ -6,7 +6,7 @@ use issueflow::{
     error::{Error, Result},
     service::{CloseReason, Service, Stage},
     target::Target,
-    transport::{SdkTransport, Transport},
+    transport::SdkTransport,
 };
 use serde_json::{Value, json};
 use std::io::Read;
@@ -14,6 +14,12 @@ use std::io::Read;
 #[derive(Parser)]
 #[command(version, about = "GitHub / GitLab issue maintenance CLI")]
 struct Cli {
+    /// Show additional safe diagnostic detail in human-readable output
+    #[arg(long, global = true)]
+    verbose: bool,
+    /// Always emit deterministic JSON, including in an interactive terminal
+    #[arg(long, global = true)]
+    json: bool,
     /// Read this env file instead of .env in the current directory
     #[arg(long, global = true, conflicts_with = "no_env_file")]
     env_file: Option<PathBuf>,
@@ -28,32 +34,105 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Inspect installed command capabilities without loading credentials
+    /// Show installed GitHub and GitLab support; does not inspect configuration or permissions
     Capabilities,
     /// Read and maintain native parent/child relationships
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Hierarchy(HierarchyCommand),
     /// Read and initialize GitLab project issue boards
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Board(BoardCommand),
-    /// Validate a secret-free GitHub workflow configuration (offline)
+    /// Validate effective or secret-free project configuration
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
+    /// Inspect and reconcile issue delivery state
     #[command(subcommand)]
-    Workflow(WorkflowCommand),
-    /// Create, inspect and explicitly merge GitHub pull requests
+    Delivery(DeliveryCommand),
+    /// Create, inspect and explicitly merge GitHub PRs and same-project GitLab MRs
     #[command(subcommand)]
     Pr(PullCommand),
     /// Read and manage GitHub Projects v2
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Project(ProjectCommand),
-    /// Show effective configuration as JSON; credentials are never included
-    Config,
-    /// Check API authentication for the configured platform (read-only)
-    Doctor,
+    /// Manage GitHub Projects and GitLab Issue Boards through one Kanban workflow
+    #[command(subcommand)]
+    Kanban(KanbanCommand),
+    /// Run read-only configuration, API, repository, and Kanban diagnostics
+    Doctor {
+        /// Secret-free project workflow configuration used to locate GitHub Projects
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+        /// Expected GitLab workflow board name
+        #[arg(long, default_value = "Issueflow Workflow")]
+        board_name: String,
+    },
     /// Create missing workflow labels in the default GitLab repository
+    #[command(hide = true)]
     SetupLabels,
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
     Issue(IssueCommand),
+    /// Deprecated compatibility alias for delivery and configuration validation
+    #[command(subcommand, hide = true)]
+    Workflow(DeliveryCommand),
+}
+
+#[derive(Subcommand)]
+enum KanbanCommand {
+    /// List Kanban containers for the configured platform
+    List {
+        /// GitHub user or organization; required for GitHub
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+    },
+    /// Show a GitHub Project URL or a GitLab board ID
+    Show { target: String },
+    /// Create or reuse a unique Kanban container
+    Create {
+        /// GitHub user or organization; required for GitHub
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+        #[arg(long)]
+        name: String,
+    },
+    /// Initialize the canonical workflow; GitLab may omit the ID to create/reuse by name
+    Init {
+        target: Option<String>,
+        #[arg(long, default_value = "Issueflow Workflow")]
+        name: String,
+    },
+    /// List items in a GitHub Project
+    Items { target: String },
+    /// Add an existing issue to a GitHub Project
+    Add { target: String, issue_url: String },
+    /// Read or set a GitHub Project Status
+    Status {
+        target: String,
+        issue_url: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Read, set, or clear a GitHub Project single-select field
+    Field {
+        target: String,
+        issue_url: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, conflicts_with = "clear")]
+        to: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// List repositories linked to a GitHub Project
+    Repositories { target: String },
+    /// Link a GitHub Project to an explicit repository
+    LinkRepository { target: String, repository: String },
 }
 
 #[derive(Subcommand)]
@@ -87,7 +166,18 @@ enum BoardCommand {
 }
 
 #[derive(Subcommand)]
-enum WorkflowCommand {
+enum ConfigCommand {
+    /// Show effective configuration; credentials are always redacted
+    Show,
+    /// Validate a secret-free project workflow configuration without loading credentials
+    Validate {
+        #[arg(long, default_value = ".issue-workflow.json")]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeliveryCommand {
     /// Read-only worktree cleanup eligibility; never deletes anything
     CleanupCheck {
         #[command(flatten)]
@@ -115,6 +205,8 @@ enum WorkflowCommand {
         #[arg(long)]
         parent_file: Option<PathBuf>,
     },
+    /// Deprecated compatibility alias for config validate
+    #[command(hide = true)]
     Validate {
         #[arg(long, default_value = ".issue-workflow.json")]
         file: PathBuf,
@@ -135,19 +227,70 @@ struct RecoveryArgs {
 }
 
 fn command_schema(c: &clap::Command) -> Value {
-    json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
+    json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().filter(|subcommand| !subcommand.is_hide_set()).map(command_schema).collect::<Vec<_>>()})
 }
-fn finish(result: Result<Value>) -> ExitCode {
+
+fn capabilities() -> Value {
+    let schema = command_schema(&Cli::command());
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "capability_schema_version": 2,
+        "scope": "installed_support",
+        "configured_platform": Value::Null,
+        "remote_permissions_checked": false,
+        "platforms": {
+            "github": {
+                "issues": "supported",
+                "sub_issues": "supported",
+                "dependencies": "supported",
+                "pull_requests": "supported",
+                "kanban": "GitHub Projects v2",
+                "delivery_recovery": "supported"
+            },
+            "gitlab": {
+                "issues": "supported",
+                "sub_issues": "same-project Issue to Task",
+                "dependencies": "supported",
+                "merge_requests": "same-project",
+                "kanban": "GitLab Issue Boards",
+                "delivery_recovery": "supported"
+            }
+        },
+        "limitations": [
+            "This command reports installed support, not the selected platform or live permissions.",
+            "GitHub Projects currently supports github.com only.",
+            "GitLab hierarchy is limited to same-project Issue to Task relationships.",
+            "GitLab merge requests must use branches in the same project."
+        ],
+        "cli_schema": schema.clone(),
+        "cli": schema
+    })
+}
+#[derive(Clone, Copy)]
+struct OutputOptions {
+    json: bool,
+    verbose: bool,
+}
+
+fn finish(result: Result<Value>, options: OutputOptions) -> ExitCode {
     match result {
         Ok(v) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&v).expect("JSON serialization")
-            );
+            if issueflow::output::use_json(options.json, std::io::stdout().is_terminal()) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v).expect("JSON serialization")
+                );
+            } else {
+                println!("{}", issueflow::output::render_success(&v, options.verbose));
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{}", json!({"error":e}));
+            if issueflow::output::use_json(options.json, std::io::stderr().is_terminal()) {
+                eprintln!("{}", json!({"error":e}));
+            } else {
+                eprintln!("{}", issueflow::output::render_error(&e, options.verbose));
+            }
             ExitCode::from(e.exit_code())
         }
     }
@@ -287,6 +430,9 @@ enum IssueCommand {
     RecoverCreate {
         #[arg(long)]
         request_id: String,
+        /// Verify that the recovered GitHub issue belongs to this parent
+        #[arg(long)]
+        parent: Option<String>,
     },
     /// Preview or apply canonical GitLab workflow metadata migration
     ReconcileMetadata {
@@ -310,6 +456,9 @@ enum IssueCommand {
         file: PathBuf,
         #[arg(long)]
         request_id: Option<String>,
+        /// Create a native GitHub Sub-issue under this parent
+        #[arg(long)]
+        parent: Option<String>,
     },
     /// Update title/body from JSON, optionally checking the last update time
     Update {
@@ -354,7 +503,47 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// List native blocking dependencies
+    /// Read the native parent issue
+    Parent { url: String },
+    /// List native Sub-issues, optionally traversing a bounded tree
+    SubIssues {
+        url: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long, requires = "recursive", value_parser = clap::value_parser!(u8).range(1..=8))]
+        depth: Option<u8>,
+    },
+    /// Read parent, Sub-issues and both dependency directions
+    Relationships { url: String },
+    /// Add an existing native Sub-issue
+    AddSubIssue {
+        parent_url: String,
+        child_url: String,
+        #[arg(long)]
+        move_from: Option<String>,
+    },
+    /// Remove a native Sub-issue from the requested parent
+    RemoveSubIssue {
+        parent_url: String,
+        child_url: String,
+    },
+    /// Remove the current native parent; no parent is a no-op
+    RemoveParent { url: String },
+    /// Reprioritize a GitHub Sub-issue relative to one sibling
+    MoveSubIssue {
+        parent_url: String,
+        child_url: String,
+        #[arg(long, conflicts_with = "after", required_unless_present = "after")]
+        before: Option<String>,
+        #[arg(long, conflicts_with = "before", required_unless_present = "before")]
+        after: Option<String>,
+    },
+    /// List issues that block this issue
+    BlockedBy { url: String },
+    /// List issues that this issue blocks
+    Blocking { url: String },
+    /// Deprecated spelling of blocked-by
+    #[command(hide = true)]
     Dependencies { url: String },
     /// Mark the first issue as blocked by the second, checking for cycles
     AddDependency { url: String, blocker_url: String },
@@ -375,9 +564,18 @@ impl IssueCommand {
             | Self::Transition { url, .. }
             | Self::Close { url, .. }
             | Self::Reopen { url, .. }
+            | Self::Parent { url }
+            | Self::SubIssues { url, .. }
+            | Self::Relationships { url }
+            | Self::RemoveParent { url }
+            | Self::BlockedBy { url }
+            | Self::Blocking { url }
             | Self::Dependencies { url }
             | Self::AddDependency { url, .. }
             | Self::RemoveDependency { url, .. } => Some(url),
+            Self::AddSubIssue { parent_url, .. }
+            | Self::RemoveSubIssue { parent_url, .. }
+            | Self::MoveSubIssue { parent_url, .. } => Some(parent_url),
         }
     }
 }
@@ -399,20 +597,47 @@ fn input<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
 }
 
 async fn execute(command: Command, config: Config) -> Result<Value> {
-    if matches!(command, Command::Config) {
+    if matches!(command, Command::SetupLabels) {
+        eprintln!("warning: `setup-labels` is deprecated; use `kanban init` instead");
+    }
+    if matches!(command, Command::Issue(IssueCommand::Dependencies { .. })) {
+        eprintln!("warning: `issue dependencies` is deprecated; use `issue blocked-by` instead");
+    }
+    if let Command::Config { command } = command {
+        debug_assert!(matches!(command, None | Some(ConfigCommand::Show)));
         return Ok(config.redacted());
     }
-    if matches!(command, Command::Doctor) {
-        let platform = config
-            .platform
-            .ok_or_else(|| Error::new("configuration", "doctor 需要指定平台"))?;
-        let transport = SdkTransport::new(&config, platform)?;
-        let user = transport.request(http::Method::GET, "user", None).await?;
-        return Ok(
-            json!({"platform": platform, "authenticated": true, "user": user["username"].as_str().or_else(|| user["login"].as_str())}),
-        );
+    if let Command::Doctor {
+        config_file,
+        board_name,
+    } = command
+    {
+        let target = Target::defaults(&config)?;
+        let transport = SdkTransport::new(&config, target.platform)?;
+        let workflow_path = config_file.or_else(|| {
+            let default = PathBuf::from(".issue-workflow.json");
+            default.exists().then_some(default)
+        });
+        let workflow = workflow_path
+            .as_ref()
+            .map(|path| input::<issueflow::workflow_config::WorkflowConfig>(path))
+            .transpose()?;
+        if let Some(workflow) = &workflow {
+            workflow.validate()?;
+        }
+        return issueflow::doctor::inspect(
+            &config,
+            &transport,
+            target,
+            workflow.as_ref(),
+            &board_name,
+        )
+        .await;
     }
     if let Command::Hierarchy(command) = command {
+        eprintln!(
+            "warning: `hierarchy` is deprecated; use the corresponding `issue` Sub-issue command"
+        );
         let parent_url = match &command {
             HierarchyCommand::Parent { issue_url } | HierarchyCommand::Children { issue_url } => {
                 issue_url
@@ -441,7 +666,287 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             }
         };
     }
+    if let Command::Kanban(command) = command {
+        use issueflow::{
+            board::Boards,
+            config::Platform,
+            project::{ProjectTarget, Projects},
+        };
+
+        let github_target = |target: &str, operation: &str| -> Result<ProjectTarget> {
+            if config.platform == Some(Platform::Gitlab) && !target.starts_with("https://") {
+                return Err(Error::new(
+                    "input",
+                    format!("kanban {operation} is not supported for GitLab Issue Boards"),
+                ));
+            }
+            ProjectTarget::parse(&config, target)
+        };
+        let gitlab_board = |target: &str| -> Result<u64> {
+            if config.platform != Some(Platform::Gitlab) {
+                return Err(Error::new(
+                    "configuration",
+                    "A numeric Kanban target requires --platform gitlab and a repository",
+                ));
+            }
+            target
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| Error::new("input", "GitLab board ID must be a positive integer"))
+        };
+        return match command {
+            KanbanCommand::List { owner, owner_type } => match config.platform {
+                Some(Platform::Github) => {
+                    let owner = owner.ok_or_else(|| {
+                        Error::new("input", "GitHub kanban list requires --owner")
+                    })?;
+                    let target = ProjectTarget::parse(
+                        &config,
+                        &format!(
+                            "https://github.com/{}/{owner}/projects/1",
+                            owner_type.path()
+                        ),
+                    )?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    Projects {
+                        transport: &transport,
+                        target,
+                    }
+                    .owner_projects()
+                    .await
+                }
+                Some(Platform::Gitlab) => {
+                    if owner.is_some() {
+                        return Err(Error::new(
+                            "input",
+                            "GitLab kanban list does not accept --owner",
+                        ));
+                    }
+                    let target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target,
+                    }
+                    .list()
+                    .await
+                }
+                None => Err(Error::new(
+                    "configuration",
+                    "kanban list requires --platform github or --platform gitlab",
+                )),
+            },
+            KanbanCommand::Create {
+                owner,
+                owner_type,
+                name,
+            } => match config.platform {
+                Some(Platform::Github) => {
+                    let owner = owner.ok_or_else(|| {
+                        Error::new("input", "GitHub kanban create requires --owner")
+                    })?;
+                    let target = ProjectTarget::parse(
+                        &config,
+                        &format!(
+                            "https://github.com/{}/{owner}/projects/1",
+                            owner_type.path()
+                        ),
+                    )?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    Projects {
+                        transport: &transport,
+                        target,
+                    }
+                    .create(&name)
+                    .await
+                }
+                Some(Platform::Gitlab) => {
+                    if owner.is_some() {
+                        return Err(Error::new(
+                            "input",
+                            "GitLab kanban create does not accept --owner",
+                        ));
+                    }
+                    let target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target,
+                    }
+                    .create(&name)
+                    .await
+                }
+                None => Err(Error::new(
+                    "configuration",
+                    "kanban create requires --platform github or --platform gitlab",
+                )),
+            },
+            KanbanCommand::Show { target } => {
+                if target.starts_with("https://") {
+                    let project = ProjectTarget::parse(&config, &target)?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    Projects {
+                        transport: &transport,
+                        target: project,
+                    }
+                    .show()
+                    .await
+                } else {
+                    let id = gitlab_board(&target)?;
+                    let board_target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target: board_target,
+                    }
+                    .show(id)
+                    .await
+                }
+            }
+            KanbanCommand::Init { target, name } => match target {
+                Some(target) if target.starts_with("https://") => {
+                    let project = ProjectTarget::parse(&config, &target)?;
+                    let repository = config.repository.clone().ok_or_else(|| {
+                        Error::new(
+                            "configuration",
+                            "GitHub kanban init requires --repository for native linkage verification",
+                        )
+                    })?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    let projects = Projects {
+                        transport: &transport,
+                        target: project,
+                    };
+                    let repository_link = projects.link_repository(&repository).await?;
+                    let workflow = projects.init_workflow().await?;
+                    Ok(json!({
+                        "platform":"github",
+                        "repository_link":repository_link,
+                        "workflow":workflow
+                    }))
+                }
+                Some(target) => {
+                    let id = gitlab_board(&target)?;
+                    let board_target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target: board_target,
+                    }
+                    .init_workflow_target(&name, Some(id))
+                    .await
+                }
+                None if config.platform == Some(Platform::Gitlab) => {
+                    let board_target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target: board_target,
+                    }
+                    .init_workflow(&name)
+                    .await
+                }
+                None => Err(Error::new(
+                    "input",
+                    "GitHub kanban init requires a canonical Project URL",
+                )),
+            },
+            KanbanCommand::Items { target } => {
+                let project = github_target(&target, "items")?;
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .items()
+                .await
+            }
+            KanbanCommand::Add { target, issue_url } => {
+                let project = github_target(&target, "add")?;
+                let issue = Target::from_url(&config, &issue_url)?;
+                if issue.platform != Platform::Github {
+                    return Err(Error::new(
+                        "input",
+                        "GitHub kanban add requires a GitHub issue",
+                    ));
+                }
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .add(&issue)
+                .await
+            }
+            KanbanCommand::Status {
+                target,
+                issue_url,
+                to,
+            } => {
+                let project = github_target(&target, "status")?;
+                let issue = Target::from_url(&config, &issue_url)?;
+                if issue.platform != Platform::Github {
+                    return Err(Error::new(
+                        "input",
+                        "GitHub kanban status requires a GitHub issue",
+                    ));
+                }
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .status(&issue, to.as_deref())
+                .await
+            }
+            KanbanCommand::Field {
+                target,
+                issue_url,
+                name,
+                to,
+                clear,
+            } => {
+                let project = github_target(&target, "field")?;
+                let issue = Target::from_url(&config, &issue_url)?;
+                if issue.platform != Platform::Github {
+                    return Err(Error::new(
+                        "input",
+                        "GitHub kanban field requires a GitHub issue",
+                    ));
+                }
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .field(&issue, &name, to.as_deref(), clear)
+                .await
+            }
+            KanbanCommand::Repositories { target } => {
+                let project = github_target(&target, "repositories")?;
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .repositories()
+                .await
+            }
+            KanbanCommand::LinkRepository { target, repository } => {
+                let project = github_target(&target, "link-repository")?;
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .link_repository(&repository)
+                .await
+            }
+        };
+    }
     if let Command::Board(command) = command {
+        eprintln!("warning: `board` is deprecated; use `kanban` instead");
         let target = Target::defaults(&config)?;
         let transport = SdkTransport::new(&config, target.platform)?;
         let boards = issueflow::board::Boards {
@@ -454,10 +959,10 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             BoardCommand::InitWorkflow { name } => boards.init_workflow(&name).await,
         };
     }
-    if let Command::Workflow(command) = command {
+    if let Command::Delivery(command) | Command::Workflow(command) = command {
         let (args, apply, expected, cleanup) = match command {
-            WorkflowCommand::Inspect(args) => (args, false, None, None),
-            WorkflowCommand::CleanupCheck {
+            DeliveryCommand::Inspect(args) => (args, false, None, None),
+            DeliveryCommand::CleanupCheck {
                 args,
                 worktree,
                 confirm_no_dependent_work,
@@ -467,7 +972,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 None,
                 Some((worktree, confirm_no_dependent_work)),
             ),
-            WorkflowCommand::Reconcile {
+            DeliveryCommand::Reconcile {
                 args,
                 apply,
                 expected_head_sha,
@@ -588,6 +1093,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         };
     }
     if let Command::Project(command) = command {
+        eprintln!("warning: `project` is deprecated; use `kanban` instead");
         use issueflow::project::{ProjectTarget, Projects};
         let target = match &command {
             ProjectCommand::List { owner, owner_type }
@@ -670,7 +1176,15 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         Command::SetupLabels => service.setup_labels().await,
         Command::Issue(command) => match command {
             IssueCommand::List => service.list().await,
-            IssueCommand::RecoverCreate { request_id } => service.recover_create(&request_id).await,
+            IssueCommand::RecoverCreate { request_id, parent } => {
+                let parent = parent
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                service
+                    .recover_create_with_parent(&request_id, parent.as_ref())
+                    .await
+            }
             IssueCommand::ReconcileMetadata { apply, .. } => {
                 service.reconcile_metadata(apply).await
             }
@@ -683,11 +1197,20 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                 }
             }
             IssueCommand::Comments { .. } => service.comments().await,
-            IssueCommand::Create { file, request_id } => {
+            IssueCommand::Create {
+                file,
+                request_id,
+                parent,
+            } => {
+                let parent = parent
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
                 service
-                    .create(
+                    .create_with_parent(
                         input(&file)?,
                         &request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        parent.as_ref(),
                     )
                     .await
             }
@@ -723,7 +1246,92 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
                     service.reopen().await
                 }
             }
-            IssueCommand::Dependencies { .. } => service.dependencies().await,
+            IssueCommand::Parent { .. } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .parent()
+                .await
+            }
+            IssueCommand::SubIssues {
+                recursive, depth, ..
+            } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .sub_issues(recursive, depth)
+                .await
+            }
+            IssueCommand::Relationships { .. } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .relationships()
+                .await
+            }
+            IssueCommand::AddSubIssue {
+                child_url,
+                move_from,
+                ..
+            } => {
+                let child = issueflow::hierarchy::target_from_url(&config, &child_url)?;
+                let old_parent = move_from
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .add_child_with_move(&child, old_parent.as_ref())
+                .await
+            }
+            IssueCommand::RemoveSubIssue { child_url, .. } => {
+                let child = issueflow::hierarchy::target_from_url(&config, &child_url)?;
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .remove_child(&child)
+                .await
+            }
+            IssueCommand::RemoveParent { .. } => {
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .remove_parent()
+                .await
+            }
+            IssueCommand::MoveSubIssue {
+                child_url,
+                before,
+                after,
+                ..
+            } => {
+                let child = issueflow::hierarchy::target_from_url(&config, &child_url)?;
+                let before = before
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                let after = after
+                    .as_deref()
+                    .map(|url| issueflow::hierarchy::target_from_url(&config, url))
+                    .transpose()?;
+                issueflow::hierarchy::Hierarchy {
+                    transport: &transport,
+                    parent: service.target.clone(),
+                }
+                .move_child(&child, before.as_ref(), after.as_ref())
+                .await
+            }
+            IssueCommand::BlockedBy { .. } | IssueCommand::Dependencies { .. } => {
+                service.blocked_by().await
+            }
+            IssueCommand::Blocking { .. } => service.blocking().await,
             IssueCommand::AddDependency { blocker_url, .. } => {
                 service
                     .add_dependency(&Target::from_url(&config, &blocker_url)?)
@@ -742,13 +1350,25 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let output = OutputOptions {
+        json: cli.json,
+        verbose: cli.verbose,
+    };
+    match &cli.command {
+        Command::Workflow(_) => {
+            eprintln!("warning: 'workflow' is deprecated; use 'delivery', or 'config validate'")
+        }
+        Command::Config { command: None } => {
+            eprintln!("warning: bare 'config' is deprecated; use 'config show'")
+        }
+        _ => {}
+    }
     match &cli.command {
         Command::Capabilities => {
-            return finish(Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"capability_schema_version":1,"cli":command_schema(&Cli::command())}),
-            ));
+            return finish(Ok(capabilities()), output);
         }
-        Command::Workflow(WorkflowCommand::ValidateContract { file, parent_file }) => {
+        Command::Delivery(DeliveryCommand::ValidateContract { file, parent_file })
+        | Command::Workflow(DeliveryCommand::ValidateContract { file, parent_file }) => {
             let result = (|| {
                 let c = input::<issueflow::branch_contract::BranchContract>(file)?;
                 let parent = parent_file
@@ -757,12 +1377,22 @@ async fn main() -> ExitCode {
                     .transpose()?;
                 c.validate(parent.as_ref())
             })();
-            return finish(result);
+            return finish(result, output);
         }
-        Command::Workflow(WorkflowCommand::Validate { file }) => {
+        Command::Config {
+            command: Some(ConfigCommand::Validate { file }),
+        } => {
             return finish(
                 input::<issueflow::workflow_config::WorkflowConfig>(file)
                     .and_then(|v| v.validate()),
+                output,
+            );
+        }
+        Command::Workflow(DeliveryCommand::Validate { file }) => {
+            return finish(
+                input::<issueflow::workflow_config::WorkflowConfig>(file)
+                    .and_then(|v| v.validate()),
+                output,
             );
         }
         _ => {}
@@ -800,17 +1430,5 @@ async fn main() -> ExitCode {
         Ok(config) => execute(cli.command, config).await,
         Err(error) => Err(Error::from(error)),
     };
-    match result {
-        Ok(value) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).expect("JSON value serialization")
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{}", serde_json::json!({"error": error}));
-            ExitCode::from(error.exit_code())
-        }
-    }
+    finish(result, output)
 }

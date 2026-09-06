@@ -129,7 +129,7 @@ fn cli_loads_explicit_file_and_accepts_environment_override() {
         .env_clear()
         .current_dir(dir.path())
         .env("ISSUEFLOW_TIMEOUT_SECONDS", "15")
-        .args(["--env-file", path.to_str().unwrap(), "config"])
+        .args(["--env-file", path.to_str().unwrap(), "config", "show"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -146,8 +146,11 @@ fn cli_does_not_search_parents_and_can_skip_file() {
     let child = dir.path().join("child");
     fs::create_dir(&child).unwrap();
     for (cwd, args) in [
-        (&child, vec!["config"]),
-        (&dir.path().to_path_buf(), vec!["--no-env-file", "config"]),
+        (&child, vec!["config", "show"]),
+        (
+            &dir.path().to_path_buf(),
+            vec!["--no-env-file", "config", "show"],
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_issueflow"))
             .env_clear()
@@ -159,4 +162,16 @@ fn cli_does_not_search_parents_and_can_skip_file() {
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["timeout_seconds"], 30);
     }
+}
+
+#[test]
+fn bare_config_remains_a_stderr_only_compatibility_alias() {
+    let output = Command::new(env!("CARGO_BIN_EXE_issueflow"))
+        .env_clear()
+        .args(["--no-env-file", "config"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deprecated"));
 }

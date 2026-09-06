@@ -9,6 +9,10 @@ use http::Method;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 
+const MAX_HIERARCHY_ITEMS: usize = 1000;
+const MAX_DIRECT_SUB_ISSUES: usize = 100;
+pub const MAX_HIERARCHY_DEPTH: u8 = 8;
+
 pub struct Hierarchy<'a> {
     pub transport: &'a dyn Transport,
     pub parent: Target,
@@ -91,13 +95,19 @@ impl Hierarchy<'_> {
                 .map(|widget| widget["parent"].clone())
                 .unwrap_or(Value::Null));
         }
-        self.transport
+        match self
+            .transport
             .request(
                 Method::GET,
                 &format!("{}/parent", self.parent.endpoint()?),
                 None,
             )
             .await
+        {
+            Ok(value) => Ok(value),
+            Err(error) if error.status == Some(404) => Ok(Value::Null),
+            Err(error) => Err(error),
+        }
     }
     pub async fn children(&self) -> Result<Value> {
         if self.parent.platform == Platform::Gitlab {
@@ -148,7 +158,118 @@ impl Hierarchy<'_> {
             transport: self.transport,
             target: self.parent.clone(),
         };
-        Ok(Value::Array(service.pages(&self.root()?).await?))
+        let children = service.pages(&self.root()?).await?;
+        if children.len() > MAX_DIRECT_SUB_ISSUES {
+            return Err(Error::new(
+                "conflict",
+                "GitHub returned more than 100 direct sub-issues",
+            ));
+        }
+        Ok(Value::Array(children))
+    }
+
+    pub async fn sub_issues(&self, recursive: bool, depth: Option<u8>) -> Result<Value> {
+        if recursive && self.parent.platform == Platform::Gitlab {
+            return Err(Error::new(
+                "input",
+                "Recursive sub-issue traversal is currently supported only for GitHub",
+            ));
+        }
+        let max_depth = depth.unwrap_or(MAX_HIERARCHY_DEPTH);
+        if !(1..=MAX_HIERARCHY_DEPTH).contains(&max_depth) {
+            return Err(Error::new("input", "depth must be between 1 and 8"));
+        }
+        let direct = self.children().await?;
+        if !recursive {
+            return Ok(Value::Array(
+                direct
+                    .as_array()
+                    .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?
+                    .iter()
+                    .enumerate()
+                    .map(|(position, item)| relationship_item(item, 1, position + 1, None))
+                    .collect::<Result<Vec<_>>>()?,
+            ));
+        }
+
+        let mut result = Vec::new();
+        let mut seen = BTreeSet::new();
+        let root_url = target_url(&self.parent);
+        let mut stack = direct
+            .as_array()
+            .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(position, item)| (item.clone(), 1_u8, position + 1, root_url.clone()))
+            .collect::<Vec<_>>();
+        while let Some((item, item_depth, position, parent_url)) = stack.pop() {
+            let child = github_target_from_item(&item)?;
+            let key = (child.repository.to_ascii_lowercase(), child.number);
+            if !seen.insert(key) {
+                return Err(Error::new(
+                    "conflict",
+                    "Hierarchy changed or repeated an item during traversal",
+                ));
+            }
+            if seen.len() > MAX_HIERARCHY_ITEMS {
+                return Err(Error::new(
+                    "conflict",
+                    "Hierarchy traversal exceeded 1000 items",
+                ));
+            }
+            result.push(relationship_item(
+                &item,
+                item_depth,
+                position,
+                Some(&parent_url),
+            )?);
+            if item_depth < max_depth {
+                let child_url = target_url(&child);
+                let descendants = Hierarchy {
+                    transport: self.transport,
+                    parent: child,
+                }
+                .children()
+                .await?;
+                for (descendant_position, descendant) in descendants
+                    .as_array()
+                    .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?
+                    .iter()
+                    .enumerate()
+                    .rev()
+                {
+                    stack.push((
+                        descendant.clone(),
+                        item_depth + 1,
+                        descendant_position + 1,
+                        child_url.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(Value::Array(result))
+    }
+
+    pub async fn relationships(&self) -> Result<Value> {
+        let parent = self.parent().await?;
+        let children = self.children().await?;
+        let service = Service {
+            transport: self.transport,
+            target: self.parent.clone(),
+        };
+        Ok(json!({
+            "parent": parent,
+            "sub_issues": children,
+            "sub_issues_summary": summary_for(&children)?,
+            "blocked_by": service.blocked_by().await?,
+            "blocking": service.blocking().await?,
+        }))
+    }
+
+    pub async fn summary(&self) -> Result<Value> {
+        let children = self.children().await?;
+        summary_for(&children)
     }
     async fn gitlab_item(&self, after: Option<&str>) -> Result<Value> {
         Self::gitlab_item_for(self.transport, &self.parent, after).await
@@ -163,7 +284,7 @@ impl Hierarchy<'_> {
             .ok_or_else(|| Error::new("input", "GitLab work item URL requires an iid"))?
             .to_string();
         let response = transport.request(Method::POST, "graphql", Some(json!({
-            "query":"query($fullPath:ID!,$iid:String!,$after:String){namespace(fullPath:$fullPath){workItem(iid:$iid){id iid title webUrl workItemType{name} widgets{type ... on WorkItemWidgetHierarchy{parent{id iid title webUrl workItemType{name}} children(first:100,after:$after){nodes{id iid title webUrl workItemType{name}} pageInfo{hasNextPage endCursor}}}}}}}",
+            "query":"query($fullPath:ID!,$iid:String!,$after:String){namespace(fullPath:$fullPath){workItem(iid:$iid){id iid title state webUrl workItemType{name} widgets{type ... on WorkItemWidgetHierarchy{parent{id iid title state webUrl workItemType{name}} children(first:100,after:$after){nodes{id iid title state webUrl workItemType{name}} pageInfo{hasNextPage endCursor}}}}}}}",
             "variables":{"fullPath":target.repository,"iid":iid,"after":after}
         }))).await?;
         if response
@@ -195,7 +316,7 @@ impl Hierarchy<'_> {
             if !seen.insert(key) {
                 continue;
             }
-            if seen.len() > 1000 {
+            if seen.len() > MAX_HIERARCHY_ITEMS {
                 return Err(Error::new(
                     "conflict",
                     "Hierarchy traversal exceeded 1000 items",
@@ -215,40 +336,57 @@ impl Hierarchy<'_> {
                 .pages(&format!("{}/sub_issues", current.endpoint()?))
                 .await?
             {
-                let url = item["html_url"]
-                    .as_str()
-                    .ok_or_else(|| Error::new("response", "Sub-issue has no URL"))?;
-                // Native GitHub sub-issues can cross repositories on the same host.
-                let parts: Vec<_> = url::Url::parse(url)
-                    .map_err(|_| Error::new("response", "Invalid sub-issue URL"))?
-                    .path()
-                    .trim_matches('/')
-                    .split('/')
-                    .map(str::to_string)
-                    .collect();
-                if parts.len() != 4 || parts[2] != "issues" {
-                    return Err(Error::new("response", "Invalid sub-issue URL"));
-                }
-                let number = parts[3]
-                    .parse()
-                    .map_err(|_| Error::new("response", "Invalid sub-issue number"))?;
-                queue.push_back(Target {
-                    platform: Platform::Github,
-                    repository: format!("{}/{}", parts[0], parts[1]),
-                    number: Some(number),
-                });
+                queue.push_back(github_target_from_item(&item)?);
             }
         }
         Ok(())
     }
     pub async fn add_child(&self, child: &Target) -> Result<Value> {
+        self.add_child_with_move(child, None).await
+    }
+    pub async fn add_child_with_move(
+        &self,
+        child: &Target,
+        expected_old_parent: Option<&Target>,
+    ) -> Result<Value> {
         if self.parent.platform == Platform::Gitlab {
+            if expected_old_parent.is_some() {
+                return Err(Error::new(
+                    "input",
+                    "GitLab parent reassignment is not supported by --move-from",
+                ));
+            }
             return self.set_gitlab_parent(child, true).await;
         }
         if child.platform != Platform::Github || child == &self.parent {
             return Err(Error::new(
                 "input",
                 "Parent and child must be distinct GitHub issues",
+            ));
+        }
+        let current_parent = Hierarchy {
+            transport: self.transport,
+            parent: child.clone(),
+        }
+        .parent()
+        .await?;
+        if !current_parent.is_null() {
+            let actual = github_target_from_item(&current_parent)?;
+            if actual == self.parent {
+                return Ok(
+                    json!({"changed":false,"parent":current_parent,"children":self.children().await?}),
+                );
+            }
+            if expected_old_parent != Some(&actual) {
+                return Err(Error::new(
+                    "conflict",
+                    "Sub-issue already belongs to another parent; pass --move-from with that parent URL",
+                ));
+            }
+        } else if expected_old_parent.is_some() {
+            return Err(Error::new(
+                "conflict",
+                "Sub-issue has no current parent matching --move-from",
             ));
         }
         self.ensure_no_cycle(child).await?;
@@ -270,6 +408,15 @@ impl Hierarchy<'_> {
         {
             return Ok(json!({"changed":false,"children":existing}));
         }
+        if existing
+            .as_array()
+            .is_some_and(|items| items.len() >= MAX_DIRECT_SUB_ISSUES)
+        {
+            return Err(Error::new(
+                "conflict",
+                "A GitHub issue cannot have more than 100 direct sub-issues",
+            ));
+        }
         self.transport
             .request(
                 Method::POST,
@@ -290,7 +437,35 @@ impl Hierarchy<'_> {
                 "Sub-issue add could not be verified",
             )));
         }
-        Ok(json!({"changed":true,"children":verified}))
+        let verified_parent = Hierarchy {
+            transport: self.transport,
+            parent: child.clone(),
+        }
+        .parent()
+        .await
+        .map_err(unknown)?;
+        if github_target_from_item(&verified_parent).map_err(unknown)? != self.parent {
+            return Err(unknown(Error::new(
+                "conflict",
+                "Sub-issue parent readback differs",
+            )));
+        }
+        if let Some(old_parent) = expected_old_parent {
+            let old_children = Hierarchy {
+                transport: self.transport,
+                parent: old_parent.clone(),
+            }
+            .children()
+            .await
+            .map_err(unknown)?;
+            if contains_target(&old_children, child).map_err(unknown)? {
+                return Err(unknown(Error::new(
+                    "conflict",
+                    "Old parent still contains the reassigned sub-issue",
+                )));
+            }
+        }
+        Ok(json!({"changed":true,"parent":verified_parent,"children":verified}))
     }
     pub async fn remove_child(&self, child: &Target) -> Result<Value> {
         if self.parent.platform == Platform::Gitlab {
@@ -335,6 +510,92 @@ impl Hierarchy<'_> {
             return Err(unknown(Error::new(
                 "conflict",
                 "Sub-issue removal could not be verified",
+            )));
+        }
+        Ok(json!({"changed":true,"children":verified}))
+    }
+
+    pub async fn remove_parent(&self) -> Result<Value> {
+        let current = self.parent().await?;
+        if current.is_null() {
+            return Ok(json!({"changed":false,"parent":Value::Null}));
+        }
+        let parent = if self.parent.platform == Platform::Github {
+            github_target_from_item(&current)?
+        } else {
+            Target {
+                platform: Platform::Gitlab,
+                repository: self.parent.repository.clone(),
+                number: current["iid"]
+                    .as_str()
+                    .and_then(|iid| iid.parse().ok())
+                    .or_else(|| current["iid"].as_u64()),
+            }
+        };
+        Hierarchy {
+            transport: self.transport,
+            parent,
+        }
+        .remove_child(&self.parent)
+        .await
+    }
+
+    pub async fn move_child(
+        &self,
+        child: &Target,
+        before: Option<&Target>,
+        after: Option<&Target>,
+    ) -> Result<Value> {
+        self.github()
+            .map_err(|_| Error::new("input", "Sub-issue ordering is not supported for GitLab"))?;
+        if before.is_some() == after.is_some() {
+            return Err(Error::new(
+                "input",
+                "Exactly one of --before or --after is required",
+            ));
+        }
+        let sibling = before.or(after).unwrap();
+        if child.platform != Platform::Github
+            || sibling.platform != Platform::Github
+            || child == sibling
+        {
+            return Err(Error::new(
+                "input",
+                "Child and sibling must be distinct GitHub issues",
+            ));
+        }
+        let children = self.children().await?;
+        if !contains_target(&children, child)? || !contains_target(&children, sibling)? {
+            return Err(Error::new(
+                "conflict",
+                "Child and sibling must both belong to the requested parent",
+            ));
+        }
+        let child_id = item_id_for_target(&children, child)?;
+        let sibling_id = item_id_for_target(&children, sibling)?;
+        let mut payload = json!({"sub_issue_id": child_id});
+        payload[if before.is_some() {
+            "before_id"
+        } else {
+            "after_id"
+        }] = json!(sibling_id);
+        self.transport
+            .request(
+                Method::PATCH,
+                &format!("{}/sub_issues/priority", self.parent.endpoint()?),
+                Some(payload),
+            )
+            .await
+            .map_err(unknown)?;
+        let verified = self.children().await.map_err(unknown)?;
+        let child_position = position_of(&verified, child).map_err(unknown)?;
+        let sibling_position = position_of(&verified, sibling).map_err(unknown)?;
+        if before.is_some() && child_position + 1 != sibling_position
+            || after.is_some() && sibling_position + 1 != child_position
+        {
+            return Err(unknown(Error::new(
+                "conflict",
+                "Sub-issue order readback differs",
             )));
         }
         Ok(json!({"changed":true,"children":verified}))
@@ -416,6 +677,139 @@ impl Hierarchy<'_> {
         }
         Ok(json!({"changed":true,"child":after}))
     }
+}
+
+pub fn github_target_from_item(item: &Value) -> Result<Target> {
+    let url = item["html_url"]
+        .as_str()
+        .or_else(|| item["url"].as_str())
+        .ok_or_else(|| Error::new("response", "GitHub issue has no URL"))?;
+    let parsed =
+        url::Url::parse(url).map_err(|_| Error::new("response", "Invalid GitHub issue URL"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(Error::new("response", "GitHub issue host is invalid"));
+    }
+    let parts: Vec<_> = parsed.path().trim_matches('/').split('/').collect();
+    if parts.len() != 4 || parts[2] != "issues" {
+        return Err(Error::new("response", "Invalid GitHub issue URL"));
+    }
+    let number = parts[3]
+        .parse()
+        .map_err(|_| Error::new("response", "Invalid GitHub issue number"))?;
+    Ok(Target {
+        platform: Platform::Github,
+        repository: format!("{}/{}", parts[0], parts[1]),
+        number: Some(number),
+    })
+}
+
+fn target_url(target: &Target) -> String {
+    match target.platform {
+        Platform::Github => format!(
+            "https://github.com/{}/issues/{}",
+            target.repository,
+            target.number.unwrap_or_default()
+        ),
+        Platform::Gitlab => String::new(),
+    }
+}
+
+fn relationship_item(
+    item: &Value,
+    depth: u8,
+    position: usize,
+    parent_url: Option<&str>,
+) -> Result<Value> {
+    let url = item["html_url"]
+        .as_str()
+        .or_else(|| item["webUrl"].as_str())
+        .or_else(|| item["web_url"].as_str())
+        .ok_or_else(|| Error::new("response", "Hierarchy item has no URL"))?;
+    let id = item["id"]
+        .as_u64()
+        .map(Value::from)
+        .or_else(|| item["id"].as_str().map(Value::from))
+        .ok_or_else(|| Error::new("response", "Hierarchy item has no native id"))?;
+    let number = item["number"]
+        .as_u64()
+        .map(Value::from)
+        .or_else(|| item["iid"].as_u64().map(Value::from))
+        .or_else(|| item["iid"].as_str().map(Value::from))
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "id": id,
+        "number": number,
+        "url": url,
+        "title": item["title"],
+        "state": item["state"],
+        "depth": depth,
+        "position": position,
+        "parent_url": parent_url
+    }))
+}
+
+fn summary_for(children: &Value) -> Result<Value> {
+    let children = children
+        .as_array()
+        .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?;
+    let completed = children
+        .iter()
+        .filter(|item| {
+            item["state"]
+                .as_str()
+                .is_some_and(|state| state.eq_ignore_ascii_case("closed"))
+        })
+        .count();
+    let total = children.len();
+    let percent = completed
+        .checked_mul(100)
+        .and_then(|value| value.checked_div(total))
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "completed": completed,
+        "total": total,
+        "percent": percent,
+        "informational": true
+    }))
+}
+
+fn contains_target(items: &Value, target: &Target) -> Result<bool> {
+    Ok(items
+        .as_array()
+        .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?
+        .iter()
+        .map(github_target_from_item)
+        .collect::<Result<Vec<_>>>()?
+        .contains(target))
+}
+
+fn item_id_for_target(items: &Value, target: &Target) -> Result<u64> {
+    items
+        .as_array()
+        .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?
+        .iter()
+        .find_map(|item| {
+            (github_target_from_item(item).ok().as_ref() == Some(target))
+                .then(|| item["id"].as_u64())
+                .flatten()
+        })
+        .ok_or_else(|| Error::new("response", "Sub-issue has no native id"))
+}
+
+fn position_of(items: &Value, target: &Target) -> Result<usize> {
+    items
+        .as_array()
+        .ok_or_else(|| Error::new("response", "Sub-issues response is not an array"))?
+        .iter()
+        .position(|item| github_target_from_item(item).ok().as_ref() == Some(target))
+        .ok_or_else(|| Error::new("conflict", "Sub-issue disappeared during order readback"))
 }
 
 fn hierarchy_parent(item: &Value) -> Option<&Value> {
