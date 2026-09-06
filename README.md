@@ -4,6 +4,12 @@ A Rust CLI for managing GitHub and GitLab issues. It accesses platform APIs dire
 
 Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; managing native blocking dependencies; and delivering GitHub pull requests or same-project GitLab merge requests. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
 
+## Output modes
+
+Direct terminal use renders concise human-readable summaries and tables. Add the global `--verbose` option before or after a subcommand to include safe diagnostic detail. Use global `--json` to force deterministic JSON; stdout redirected to a pipe or file also remains JSON by default, preserving existing automation. Errors and warnings are written to stderr, and output formatting does not change command behavior or exit codes.
+
+Human-readable output does not use ANSI color, so it also respects terminals and automation that set `NO_COLOR`. Configuration remains redacted in every mode; verbose rendering additionally masks fields whose names indicate tokens, authorization values, passwords, secrets, or cookies.
+
 ## Build and usage
 
 ```sh
