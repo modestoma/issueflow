@@ -250,16 +250,18 @@ For GitLab, `pr list/show/create/update/ready/checks/merge` use the configured i
 
 Current commands do not evaluate every repository merge policy. Review required checks using available repository evidence or the PR/MR page before granting merge approval. [GitHub PR API reference](https://docs.github.com/en/rest/pulls/pulls), [GitLab Merge Requests API reference](https://docs.gitlab.com/api/merge_requests/).
 
-### Native parent and child hierarchy
+### Native GitHub parent and child hierarchy
 
 ```sh
-issueflow hierarchy parent ISSUE_OR_WORK_ITEM_URL
-issueflow hierarchy children ISSUE_OR_WORK_ITEM_URL
+issueflow hierarchy parent GITHUB_ISSUE_URL
+issueflow hierarchy children GITHUB_ISSUE_URL
 issueflow hierarchy add-child PARENT_URL CHILD_URL
 issueflow hierarchy remove-child PARENT_URL CHILD_URL
 ```
 
-GitHub uses native Sub-issues REST endpoints. Adds traverse up to 1,000 descendants before writing to reject cycles, reuse an existing relationship, and read back mutations. GitLab uses the versionless Work Item GraphQL hierarchy widget through the configured instance `/api/graphql` endpoint. The project-level adapter supports the reliable `Issue -> Task` combination only: both items must be distinct and in the same project, their native Work Item types are read before mutation, an existing different parent causes a conflict, and `workItemUpdate.hierarchyWidget.parentId` is verified by rereading the child. Arbitrary `Issue -> Issue`, group Epic mapping, and hierarchy reordering are not claimed. Native hierarchy never implies a blocking dependency; keep branch contracts and blocking links explicit. [GitHub Sub-issues API](https://docs.github.com/en/rest/issues/sub-issues), [GitLab child items](https://docs.gitlab.com/user/work_items/child_items/).
+These commands accept GitHub issue URLs only and use the native Sub-issues REST endpoints. Adds traverse up to 1,000 descendants before writing to reject cycles, reuse an existing relationship, and read back mutations. [GitHub Sub-issues API](https://docs.github.com/en/rest/issues/sub-issues).
+
+GitLab child work is represented by ordinary issues. After creation, record the child's full URL in the parent body and the parent's full URL in the child body, and keep the branch delivery contract explicit: the child branch starts from and targets the parent integration branch. Do not substitute a personal to-do, Markdown checklist, or related-issue link for parenthood. Logical parenthood does not imply a blocking dependency; add blocking links separately when execution order requires them.
 
 ### Validate parent/child branch contracts
 
