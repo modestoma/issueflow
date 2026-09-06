@@ -40,7 +40,7 @@ enum Command {
     #[command(subcommand)]
     Hierarchy(HierarchyCommand),
     /// Read and initialize GitLab project issue boards
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Board(BoardCommand),
     /// Validate effective or secret-free project configuration
     Config {
@@ -54,8 +54,11 @@ enum Command {
     #[command(subcommand)]
     Pr(PullCommand),
     /// Read and manage GitHub Projects v2
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Project(ProjectCommand),
+    /// Manage GitHub Projects and GitLab Issue Boards through one Kanban workflow
+    #[command(subcommand)]
+    Kanban(KanbanCommand),
     /// Run read-only configuration, API, repository, and Kanban diagnostics
     Doctor {
         /// Secret-free project workflow configuration used to locate GitHub Projects
@@ -66,6 +69,7 @@ enum Command {
         board_name: String,
     },
     /// Create missing workflow labels in the default GitLab repository
+    #[command(hide = true)]
     SetupLabels,
     /// Read and maintain issues using their full platform URLs
     #[command(subcommand)]
@@ -73,6 +77,62 @@ enum Command {
     /// Deprecated compatibility alias for delivery and configuration validation
     #[command(subcommand, hide = true)]
     Workflow(DeliveryCommand),
+}
+
+#[derive(Subcommand)]
+enum KanbanCommand {
+    /// List Kanban containers for the configured platform
+    List {
+        /// GitHub user or organization; required for GitHub
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+    },
+    /// Show a GitHub Project URL or a GitLab board ID
+    Show { target: String },
+    /// Create or reuse a unique Kanban container
+    Create {
+        /// GitHub user or organization; required for GitHub
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long, value_enum, default_value = "user")]
+        owner_type: ProjectOwner,
+        #[arg(long)]
+        name: String,
+    },
+    /// Initialize the canonical workflow; GitLab may omit the ID to create/reuse by name
+    Init {
+        target: Option<String>,
+        #[arg(long, default_value = "Issueflow Workflow")]
+        name: String,
+    },
+    /// List items in a GitHub Project
+    Items { target: String },
+    /// Add an existing issue to a GitHub Project
+    Add { target: String, issue_url: String },
+    /// Read or set a GitHub Project Status
+    Status {
+        target: String,
+        issue_url: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Read, set, or clear a GitHub Project single-select field
+    Field {
+        target: String,
+        issue_url: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, conflicts_with = "clear")]
+        to: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// List repositories linked to a GitHub Project
+    Repositories { target: String },
+    /// Link a GitHub Project to an explicit repository
+    LinkRepository { target: String, repository: String },
 }
 
 #[derive(Subcommand)]
@@ -167,7 +227,7 @@ struct RecoveryArgs {
 }
 
 fn command_schema(c: &clap::Command) -> Value {
-    json!({"name":c.get_name(),"hidden":c.is_hide_set(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().map(command_schema).collect::<Vec<_>>()})
+    json!({"name":c.get_name(),"options":c.get_arguments().filter_map(|a|a.get_long()).collect::<Vec<_>>(),"subcommands":c.get_subcommands().filter(|subcommand| !subcommand.is_hide_set()).map(command_schema).collect::<Vec<_>>()})
 }
 
 fn capabilities() -> Value {
@@ -482,6 +542,9 @@ fn input<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
 }
 
 async fn execute(command: Command, config: Config) -> Result<Value> {
+    if matches!(command, Command::SetupLabels) {
+        eprintln!("warning: `setup-labels` is deprecated; use `kanban init` instead");
+    }
     if let Command::Config { command } = command {
         debug_assert!(matches!(command, None | Some(ConfigCommand::Show)));
         return Ok(config.redacted());
@@ -542,7 +605,287 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
             }
         };
     }
+    if let Command::Kanban(command) = command {
+        use issueflow::{
+            board::Boards,
+            config::Platform,
+            project::{ProjectTarget, Projects},
+        };
+
+        let github_target = |target: &str, operation: &str| -> Result<ProjectTarget> {
+            if config.platform == Some(Platform::Gitlab) && !target.starts_with("https://") {
+                return Err(Error::new(
+                    "input",
+                    format!("kanban {operation} is not supported for GitLab Issue Boards"),
+                ));
+            }
+            ProjectTarget::parse(&config, target)
+        };
+        let gitlab_board = |target: &str| -> Result<u64> {
+            if config.platform != Some(Platform::Gitlab) {
+                return Err(Error::new(
+                    "configuration",
+                    "A numeric Kanban target requires --platform gitlab and a repository",
+                ));
+            }
+            target
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| Error::new("input", "GitLab board ID must be a positive integer"))
+        };
+        return match command {
+            KanbanCommand::List { owner, owner_type } => match config.platform {
+                Some(Platform::Github) => {
+                    let owner = owner.ok_or_else(|| {
+                        Error::new("input", "GitHub kanban list requires --owner")
+                    })?;
+                    let target = ProjectTarget::parse(
+                        &config,
+                        &format!(
+                            "https://github.com/{}/{owner}/projects/1",
+                            owner_type.path()
+                        ),
+                    )?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    Projects {
+                        transport: &transport,
+                        target,
+                    }
+                    .owner_projects()
+                    .await
+                }
+                Some(Platform::Gitlab) => {
+                    if owner.is_some() {
+                        return Err(Error::new(
+                            "input",
+                            "GitLab kanban list does not accept --owner",
+                        ));
+                    }
+                    let target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target,
+                    }
+                    .list()
+                    .await
+                }
+                None => Err(Error::new(
+                    "configuration",
+                    "kanban list requires --platform github or --platform gitlab",
+                )),
+            },
+            KanbanCommand::Create {
+                owner,
+                owner_type,
+                name,
+            } => match config.platform {
+                Some(Platform::Github) => {
+                    let owner = owner.ok_or_else(|| {
+                        Error::new("input", "GitHub kanban create requires --owner")
+                    })?;
+                    let target = ProjectTarget::parse(
+                        &config,
+                        &format!(
+                            "https://github.com/{}/{owner}/projects/1",
+                            owner_type.path()
+                        ),
+                    )?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    Projects {
+                        transport: &transport,
+                        target,
+                    }
+                    .create(&name)
+                    .await
+                }
+                Some(Platform::Gitlab) => {
+                    if owner.is_some() {
+                        return Err(Error::new(
+                            "input",
+                            "GitLab kanban create does not accept --owner",
+                        ));
+                    }
+                    let target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target,
+                    }
+                    .create(&name)
+                    .await
+                }
+                None => Err(Error::new(
+                    "configuration",
+                    "kanban create requires --platform github or --platform gitlab",
+                )),
+            },
+            KanbanCommand::Show { target } => {
+                if target.starts_with("https://") {
+                    let project = ProjectTarget::parse(&config, &target)?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    Projects {
+                        transport: &transport,
+                        target: project,
+                    }
+                    .show()
+                    .await
+                } else {
+                    let id = gitlab_board(&target)?;
+                    let board_target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target: board_target,
+                    }
+                    .show(id)
+                    .await
+                }
+            }
+            KanbanCommand::Init { target, name } => match target {
+                Some(target) if target.starts_with("https://") => {
+                    let project = ProjectTarget::parse(&config, &target)?;
+                    let repository = config.repository.clone().ok_or_else(|| {
+                        Error::new(
+                            "configuration",
+                            "GitHub kanban init requires --repository for native linkage verification",
+                        )
+                    })?;
+                    let transport = SdkTransport::new(&config, Platform::Github)?;
+                    let projects = Projects {
+                        transport: &transport,
+                        target: project,
+                    };
+                    let repository_link = projects.link_repository(&repository).await?;
+                    let workflow = projects.init_workflow().await?;
+                    Ok(json!({
+                        "platform":"github",
+                        "repository_link":repository_link,
+                        "workflow":workflow
+                    }))
+                }
+                Some(target) => {
+                    let id = gitlab_board(&target)?;
+                    let board_target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target: board_target,
+                    }
+                    .init_workflow_target(&name, Some(id))
+                    .await
+                }
+                None if config.platform == Some(Platform::Gitlab) => {
+                    let board_target = Target::defaults(&config)?;
+                    let transport = SdkTransport::new(&config, Platform::Gitlab)?;
+                    Boards {
+                        transport: &transport,
+                        target: board_target,
+                    }
+                    .init_workflow(&name)
+                    .await
+                }
+                None => Err(Error::new(
+                    "input",
+                    "GitHub kanban init requires a canonical Project URL",
+                )),
+            },
+            KanbanCommand::Items { target } => {
+                let project = github_target(&target, "items")?;
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .items()
+                .await
+            }
+            KanbanCommand::Add { target, issue_url } => {
+                let project = github_target(&target, "add")?;
+                let issue = Target::from_url(&config, &issue_url)?;
+                if issue.platform != Platform::Github {
+                    return Err(Error::new(
+                        "input",
+                        "GitHub kanban add requires a GitHub issue",
+                    ));
+                }
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .add(&issue)
+                .await
+            }
+            KanbanCommand::Status {
+                target,
+                issue_url,
+                to,
+            } => {
+                let project = github_target(&target, "status")?;
+                let issue = Target::from_url(&config, &issue_url)?;
+                if issue.platform != Platform::Github {
+                    return Err(Error::new(
+                        "input",
+                        "GitHub kanban status requires a GitHub issue",
+                    ));
+                }
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .status(&issue, to.as_deref())
+                .await
+            }
+            KanbanCommand::Field {
+                target,
+                issue_url,
+                name,
+                to,
+                clear,
+            } => {
+                let project = github_target(&target, "field")?;
+                let issue = Target::from_url(&config, &issue_url)?;
+                if issue.platform != Platform::Github {
+                    return Err(Error::new(
+                        "input",
+                        "GitHub kanban field requires a GitHub issue",
+                    ));
+                }
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .field(&issue, &name, to.as_deref(), clear)
+                .await
+            }
+            KanbanCommand::Repositories { target } => {
+                let project = github_target(&target, "repositories")?;
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .repositories()
+                .await
+            }
+            KanbanCommand::LinkRepository { target, repository } => {
+                let project = github_target(&target, "link-repository")?;
+                let transport = SdkTransport::new(&config, Platform::Github)?;
+                Projects {
+                    transport: &transport,
+                    target: project,
+                }
+                .link_repository(&repository)
+                .await
+            }
+        };
+    }
     if let Command::Board(command) = command {
+        eprintln!("warning: `board` is deprecated; use `kanban` instead");
         let target = Target::defaults(&config)?;
         let transport = SdkTransport::new(&config, target.platform)?;
         let boards = issueflow::board::Boards {
@@ -689,6 +1032,7 @@ async fn execute(command: Command, config: Config) -> Result<Value> {
         };
     }
     if let Command::Project(command) = command {
+        eprintln!("warning: `project` is deprecated; use `kanban` instead");
         use issueflow::project::{ProjectTarget, Projects};
         let target = match &command {
             ProjectCommand::List { owner, owner_type }

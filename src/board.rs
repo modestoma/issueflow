@@ -46,9 +46,49 @@ impl Boards<'_> {
         }
         Ok(value)
     }
-    pub async fn init_workflow(&self, name: &str) -> Result<Value> {
+    pub async fn create(&self, name: &str) -> Result<Value> {
         if name.trim().is_empty() {
             return Err(Error::new("input", "Board name cannot be empty"));
+        }
+        let boards = self.list().await?;
+        let matches: Vec<_> = boards
+            .as_array()
+            .expect("board list is always an array")
+            .iter()
+            .filter(|board| board["name"].as_str() == Some(name))
+            .collect();
+        if matches.len() > 1 {
+            return Err(Error::new(
+                "conflict",
+                "Multiple GitLab boards have the requested name",
+            ));
+        }
+        if let Some(board) = matches.first() {
+            let id = board["id"]
+                .as_u64()
+                .ok_or_else(|| Error::new("response", "GitLab board has no id"))?;
+            return Ok(json!({"changed":false,"board":self.show(id).await?}));
+        }
+        let created = self
+            .transport
+            .request(Method::POST, &self.root()?, Some(json!({"name":name})))
+            .await
+            .map_err(unknown)?;
+        let id = created["id"]
+            .as_u64()
+            .ok_or_else(|| unknown(Error::new("response", "Created GitLab board has no id")))?;
+        Ok(json!({"changed":true,"board":self.show(id).await.map_err(unknown)?}))
+    }
+    pub async fn init_workflow(&self, name: &str) -> Result<Value> {
+        self.init_workflow_target(name, None).await
+    }
+    pub async fn init_workflow_target(&self, name: &str, board_id: Option<u64>) -> Result<Value> {
+        if name.trim().is_empty() {
+            return Err(Error::new("input", "Board name cannot be empty"));
+        }
+        if let Some(board_id) = board_id {
+            // Resolve an explicit target before setup_labels performs any writes.
+            self.show(board_id).await?;
         }
         self.service().setup_labels().await?;
         let labels = self
@@ -78,38 +118,42 @@ impl Boards<'_> {
                 "Not all GitLab workflow labels are visible",
             ));
         }
-        let boards = self.list().await?;
-        let matches: Vec<_> = boards
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|board| board["name"].as_str() == Some(name))
-            .collect();
-        if matches.len() > 1 {
-            return Err(Error::new(
-                "conflict",
-                "Multiple GitLab boards have the workflow name",
-            ));
-        }
-        let (board_id, created) = if let Some(board) = matches.first() {
-            (
-                board["id"]
-                    .as_u64()
-                    .ok_or_else(|| Error::new("response", "GitLab board has no id"))?,
-                false,
-            )
+        let (board_id, created) = if let Some(board_id) = board_id {
+            (board_id, false)
         } else {
-            let created = self
-                .transport
-                .request(Method::POST, &self.root()?, Some(json!({"name":name})))
-                .await
-                .map_err(unknown)?;
-            (
-                created["id"].as_u64().ok_or_else(|| {
-                    unknown(Error::new("response", "Created GitLab board has no id"))
-                })?,
-                true,
-            )
+            let boards = self.list().await?;
+            let matches: Vec<_> = boards
+                .as_array()
+                .expect("board list is always an array")
+                .iter()
+                .filter(|board| board["name"].as_str() == Some(name))
+                .collect();
+            if matches.len() > 1 {
+                return Err(Error::new(
+                    "conflict",
+                    "Multiple GitLab boards have the workflow name",
+                ));
+            }
+            if let Some(board) = matches.first() {
+                (
+                    board["id"]
+                        .as_u64()
+                        .ok_or_else(|| Error::new("response", "GitLab board has no id"))?,
+                    false,
+                )
+            } else {
+                let created = self
+                    .transport
+                    .request(Method::POST, &self.root()?, Some(json!({"name":name})))
+                    .await
+                    .map_err(unknown)?;
+                (
+                    created["id"].as_u64().ok_or_else(|| {
+                        unknown(Error::new("response", "Created GitLab board has no id"))
+                    })?,
+                    true,
+                )
+            }
         };
         let lists_root = format!("{}/{board_id}/lists", self.root()?);
         let existing = self.service().pages(&lists_root).await?;

@@ -2,7 +2,7 @@
 
 A Rust CLI for managing GitHub and GitLab issues. It accesses platform APIs directly through SDKs, without requiring `gh`, `glab`, or Python.
 
-Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; managing native blocking dependencies; and delivering GitHub pull requests or same-project GitLab merge requests. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
+Supports reading, creating, updating, and commenting on issues; managing labels; closing and reopening issues; changing workflow stages; managing native blocking dependencies; maintaining GitHub Projects or GitLab Issue Boards through one `kanban` facade; and delivering GitHub pull requests or same-project GitLab merge requests. GitHub uses `octocrab =0.54.1`. GitLab uses the endpoint/query extension interfaces in `gitlab =0.1804.0` with a controlled HTTP client that supports instance base paths, timeouts, and disabled redirects. Endpoints not covered by the SDK use the same adapter. GitHub workflows use Project fields exclusively; GitLab retains label-based workflow stages.
 
 ## Output modes
 
@@ -45,7 +45,7 @@ Example `issue.json`:
 ```
 
 ```sh
-issueflow project init-workflow https://github.com/users/owner/projects/1
+issueflow --repository owner/repo kanban init https://github.com/users/owner/projects/1
 issueflow --platform github --repository owner/repo issue create --file issue.json
 issueflow issue update https://github.com/owner/repo/issues/42 --file changes.json --expected-updated-at '2026-09-05T08:00:00Z'
 issueflow issue comment https://github.com/owner/repo/issues/42 --file progress.md
@@ -85,12 +85,12 @@ The command scans visible open and closed issues and returns `found`, `not_visib
 
 ### Issue state and GitLab labels
 
-GitHub close/reopen now change **native state only** and preserve all existing labels. Workflow metadata belongs in the required Project; set Resolution and Status explicitly through Project commands. GitHub `issue transition` and `setup-labels` reject workflow label operations and direct callers to Project commands. The generic `issue labels` API remains available for explicitly requested legacy label maintenance, not routine GitHub workflow execution. Existing repository labels are not bulk-deleted or automatically migrated.
+GitHub close/reopen now change **native state only** and preserve all existing labels. Workflow metadata belongs in the required Project; set Resolution and Status explicitly through `kanban` commands. GitHub `issue transition` rejects workflow label operations and directs callers to Kanban commands. The generic `issue labels` API remains available for explicitly requested legacy label maintenance, not routine GitHub workflow execution. Existing repository labels are not bulk-deleted or automatically migrated.
 
 GitLab retains the label workflow:
 
 ```sh
-issueflow --platform gitlab --repository group/repo setup-labels
+issueflow --platform gitlab --repository group/repo kanban init
 issueflow issue transition https://gitlab.example.com/group/repo/-/issues/42 --to in-progress
 issueflow issue labels https://gitlab.example.com/group/repo/-/issues/42 --add blocked
 issueflow issue close https://gitlab.example.com/group/repo/-/issues/42 --reason completed
@@ -108,17 +108,25 @@ issueflow issue reconcile-metadata ISSUE_URL --apply
 
 The command maps the seven legacy Chinese workflow labels to the six canonical stages, preserves clarification separately, maps legacy resolution labels to English values, and derives `blocked` from native blocking relationships. Preview is the default. Apply performs one targeted label update with readback; ambiguous or mixed stages stop without writing. Repository-wide migration and legacy label/list deletion are intentionally not automatic.
 
+## Cross-platform Kanban
+
+`kanban` is the user-facing planning entry point. It routes GitHub Project URLs and configured GitLab project Issue Boards without pretending their data models are identical. The visible command set is `list`, `show`, `create`, `init`, `items`, `add`, `status`, `field`, `repositories`, and `link-repository`.
+
+The old top-level `project`, `board`, and `setup-labels` commands remain executable as hidden compatibility aliases for one release. They preserve their existing behavior and write deprecation warnings to stderr only. New automation should use `kanban`.
+
 ### GitLab Issue Boards
 
 Self-hosted GitLab workflows can use a project Issue Board whose columns are backed by the same `workflow::*` labels:
 
 ```sh
-issueflow --platform gitlab --repository group/repo board list
-issueflow --platform gitlab --repository group/repo board show 3
-issueflow --platform gitlab --repository group/repo board init-workflow
+issueflow --platform gitlab --repository group/repo kanban list
+issueflow --platform gitlab --repository group/repo kanban show 3
+issueflow --platform gitlab --repository group/repo kanban create --name 'Team Board'
+issueflow --platform gitlab --repository group/repo kanban init
+issueflow --platform gitlab --repository group/repo kanban init 3
 ```
 
-`board init-workflow` uses the default name `Issueflow Workflow`; override it with `--name`. It ensures all workflow labels, reuses a unique exact-name board or creates one, adds only missing label lists, orders the six canonical workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Legacy columns are reported as `legacy_lists` with `legacy_cleanup_required=true`; they are not silently deleted. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
+`kanban create` reuses a unique exact-name board or creates it and reads it back. `kanban init` uses the default name `Issueflow Workflow`; override it with `--name`, or provide an explicit positive board ID to initialize that existing board. Initialization ensures all workflow labels, adds only missing label lists, orders the six canonical workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Legacy columns are reported as `legacy_lists` with `legacy_cleanup_required=true`; they are not silently deleted. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name or board ID rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. GitLab does not provide parity for Project items, arbitrary fields, repository links, or Project Status through this facade; those subcommands fail before API access. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
 
 ### Dependencies
 
@@ -132,21 +140,21 @@ The first issue is **blocked by the second issue**. Before adding a dependency, 
 
 Dependency lists retain native relationship data. The CLI does not automatically unblock development or close issues, since a closed issue may have been cancelled. Checking and adding a dependency are not transactional across users; the remote state remains authoritative. Parent/child hierarchy is independent of blocking and does not automatically authorize work or delivery.
 
-## GitHub Projects
+### GitHub Projects
 
 Projects v2 commands support user-owned and organization-owned projects on **github.com**. GitHub Enterprise Projects routing is not supported in this version; custom GitHub API bases are rejected by these commands. Existing issue commands retain their previous platform support.
 
 Use a canonical Project URL, not a board view URL with `/views/N` or query parameters:
 
 ```sh
-issueflow --no-env-file project show https://github.com/users/modestoma/projects/1
-issueflow --no-env-file project items https://github.com/users/modestoma/projects/1
-issueflow --no-env-file project add https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4
-issueflow --no-env-file project status https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4
-issueflow --no-env-file project status https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4 --to 'In progress'
+issueflow --no-env-file kanban show https://github.com/users/modestoma/projects/1
+issueflow --no-env-file kanban items https://github.com/users/modestoma/projects/1
+issueflow --no-env-file kanban add https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4
+issueflow --no-env-file kanban status https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4
+issueflow --no-env-file kanban status https://github.com/users/modestoma/projects/1 https://github.com/modestoma/issueflow/issues/4 --to 'In progress'
 ```
 
-For organization projects, use `https://github.com/orgs/OWNER/projects/N`. Project and issue URLs are explicit; these commands do not require default platform/repository configuration. They use `ISSUEFLOW_GITHUB_TOKEN` and the same configuration precedence as other commands. `--no-env-file` ensures authentication comes from the process environment.
+For organization projects, use `https://github.com/orgs/OWNER/projects/N`. Project and issue URLs are explicit. Ordinary Project operations do not require default platform/repository configuration; `kanban init` additionally requires a repository so it can establish and verify the native link. These commands use `ISSUEFLOW_GITHUB_TOKEN` and the same configuration precedence as other commands. `--no-env-file` ensures authentication comes from the process environment.
 
 `show` returns metadata and field definitions, including Status option names and IDs. `items` lists all visible Project items with their Status, including draft issues and pull requests; hidden content may be null. Fields and items use cursor pagination, with repeated IDs/cursors and incomplete results treated as errors. The limit is 1,000 pages per connection.
 
@@ -164,21 +172,21 @@ For a board using these stages, the recommended workflow mapping is:
 
 Use Cancelled for termination and Resolution to distinguish Cancelled, Duplicate and Invalid; do not interpret every closed issue as Done. Routine status changes never create fields or options.
 
-GitHub workflows require a configured Project before work begins. If none exists, create/reuse one, run `project init-workflow`, verify the Board and fields, and save the confirmed URL. Do not fall back to labels when configuration or permissions are missing. Native issue Open/Closed and blocking dependencies remain separate from Project metadata.
+GitHub workflows require a configured Project before work begins. If none exists, create/reuse one, run `kanban init`, verify the Board and fields, and save the confirmed URL. Do not fall back to labels when configuration or permissions are missing. Native issue Open/Closed and blocking dependencies remain separate from Project metadata.
 
 **Project Status and issue state are separate.** The CLI does not send issue-close mutations when changing Status. However, GitHub Project automations can close issues or overwrite Status when items change. Inspect the Project's Workflows settings before using live status writes; disable automatic closure if it would bypass human acceptance. Moving a card does not launch Codex or authorize merging or deployment.
 
 ### Project onboarding
 
 ```sh
-issueflow project list --owner modestoma
-issueflow project create --owner modestoma --title 'My workflow'
-issueflow project init-workflow https://github.com/users/modestoma/projects/2
+issueflow --platform github kanban list --owner modestoma
+issueflow --platform github kanban create --owner modestoma --name 'My workflow'
+issueflow --repository modestoma/issueflow kanban init https://github.com/users/modestoma/projects/2
 ```
 
 Use `--owner-type organization` for an organization. `list` reads all visible Projects for the explicit owner. `create` reuses a unique open Project with the exact title, rejects ambiguous/closed matches, or creates a new Project and verifies it by its returned ID/number. No mutation is automatically retried. Title lookup is best-effort reuse, not an atomic idempotency guarantee; after an unknown outcome inspect the owner's Project list before any new create attempt.
 
-`init-workflow` initializes the following single-select fields while preserving existing option IDs, names, colors and descriptions:
+GitHub `kanban init` requires an explicit `--repository`. It reuses or creates the native Project-to-repository link with readback, then initializes the following single-select fields while preserving existing option IDs, names, colors and descriptions:
 
 | Field | Options |
 | --- | --- |
@@ -190,14 +198,14 @@ Use `--owner-type organization` for an organization. `list` reads all visible Pr
 
 GitHub reserves the field name `Type`, so the custom field is named **Work type**. Existing defaults/options are retained. A Board view with Status as its vertical column grouping is reused, or an `Issueflow Kanban` view is created and read back. Unrelated views are not overwritten. An existing dedicated view with incompatible grouping/filter produces an error. Project automations remain unchanged.
 
-The API updates complete option lists; the final read-before-write check is not an atomic lock against concurrent edits. Initialization can partially succeed, so inspect fields/views before retrying. `project views URL` provides read-only view evidence; `init-statuses` remains available for Status-only initialization.
+The API updates complete option lists; the final read-before-write check is not an atomic lock against concurrent edits. Initialization can partially succeed, so inspect the `kanban show` result and initialization readback before retrying. The hidden compatibility alias retains the old Status-only initialization command for one release.
 
 ```sh
-issueflow project field PROJECT_URL ISSUE_URL --name 'Work type' --to feature
-issueflow project field PROJECT_URL ISSUE_URL --name Priority --to P2
-issueflow project field PROJECT_URL ISSUE_URL --name Blocked --to Yes
-issueflow project field PROJECT_URL ISSUE_URL --name Resolution --to Completed
-issueflow project field PROJECT_URL ISSUE_URL --name Resolution --clear
+issueflow kanban field PROJECT_URL ISSUE_URL --name 'Work type' --to feature
+issueflow kanban field PROJECT_URL ISSUE_URL --name Priority --to P2
+issueflow kanban field PROJECT_URL ISSUE_URL --name Blocked --to Yes
+issueflow kanban field PROJECT_URL ISSUE_URL --name Resolution --to Completed
+issueflow kanban field PROJECT_URL ISSUE_URL --name Resolution --clear
 ```
 
 Omitting `--to` and `--clear` reads the field. Names/options match exactly; missing/ambiguous fields fail before writing. Add the issue first. Clear Resolution on reopening, reconsider Blocked and set the actual workflow stage. The CLI does not read legacy labels to infer these values or bulk-remove them. Migrate existing issue metadata deliberately before switching its source of truth.
@@ -434,8 +442,8 @@ Live GitHub validation passed the main issue maintenance operations but reproduc
 After creating or selecting the workflow Project, establish its native repository link before saving onboarding configuration:
 
 ```sh
-issueflow --no-env-file project link-repository PROJECT_URL OWNER/REPOSITORY
-issueflow --no-env-file project repositories PROJECT_URL
+issueflow --no-env-file kanban link-repository PROJECT_URL OWNER/REPOSITORY
+issueflow --no-env-file kanban repositories PROJECT_URL
 ```
 
 The link makes the Project accessible from the repository's Projects entry. It is separate from adding an issue to a Project and from recording `github_project_url` locally. Existing links are reused without mutation; other repository links are preserved. Both commands paginate links. Linking reads back the association and reports unknown outcomes without retrying mutations. A failed link does not undo successful Project creation: inspect and resume using the existing Project URL. Project creation remains an explicit owner-scoped operation. The API is documented in [GitHub's Projects reference](https://docs.github.com/en/graphql/reference/projects#linkprojectv2torepository).
