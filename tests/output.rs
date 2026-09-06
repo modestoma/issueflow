@@ -28,7 +28,7 @@ fn piped_stdout_preserves_json_without_an_explicit_flag() {
     let output = issueflow().arg("capabilities").output().unwrap();
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["capability_schema_version"], 1);
+    assert_eq!(value["capability_schema_version"], 2);
 }
 
 #[test]

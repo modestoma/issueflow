@@ -2,6 +2,7 @@ pub mod board;
 pub mod branch_contract;
 pub mod cleanup;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod hierarchy;
 pub mod output;
