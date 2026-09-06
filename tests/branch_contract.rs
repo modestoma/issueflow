@@ -76,3 +76,31 @@ fn gitlab_contract_preserves_non_default_port() {
     .unwrap();
     assert!(contract.validate(None).is_ok());
 }
+
+#[test]
+fn gitlab_task_child_contract_is_supported() {
+    let parent: BranchContract = serde_json::from_value(json!({
+        "schema_version":1,
+        "issue_url":"https://gitlab.example/group/repo/-/issues/1",
+        "parent_issue_url":null,
+        "source_branch":"main",
+        "branch":"chore/gitlab_e2e_parent",
+        "pr_target":"main",
+        "pr_url":null
+    }))
+    .unwrap();
+    let child: BranchContract = serde_json::from_value(json!({
+        "schema_version":1,
+        "issue_url":"https://gitlab.example/group/repo/-/work_items/9",
+        "parent_issue_url":"https://gitlab.example/group/repo/-/issues/1",
+        "source_branch":"chore/gitlab_e2e_parent",
+        "branch":"chore/gitlab_e2e_child_a",
+        "pr_target":"chore/gitlab_e2e_parent",
+        "pr_url":null
+    }))
+    .unwrap();
+
+    let value = child.validate(Some(&parent)).unwrap();
+    assert_eq!(value["relationship"], "child");
+    assert_eq!(value["remote_verified"], false);
+}
