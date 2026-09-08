@@ -4,7 +4,7 @@ use crate::{
     error::{Error, Result},
     project::{ProjectTarget, Projects},
     pull::{PullState, Pulls, target_from_url},
-    service::{CloseReason, Service},
+    service::{CloseReason, Service, gitlab_metadata},
     target::{Target, encode},
     transport::Transport,
     workflow_config::{DeliveryPolicy, WorkflowConfig},
@@ -197,25 +197,17 @@ impl Recovery<'_> {
         if t.platform == Platform::Gitlab {
             let labels = issue["labels"].as_array().ok_or_else(bad)?;
             let names: Vec<_> = labels.iter().filter_map(Value::as_str).collect();
-            let stages: Vec<_> = names
-                .iter()
-                .filter(|name| name.starts_with("workflow::"))
-                .collect();
-            if stages.len() != 1 {
-                return Err(Error::new(
-                    "conflict",
-                    "GitLab issue must have exactly one workflow stage label",
-                ));
-            }
+            let owned: Vec<_> = names.iter().map(|s| s.to_string()).collect();
+            let (stage, resolution) = gitlab_metadata(&owned, s.issue_state == "closed")?;
             s.project_blocked = names.contains(&"blocked");
-            s.has_resolution = names.iter().any(|name| name.starts_with("resolution::"));
+            s.resolution = resolution.map(|r| r.trim_start_matches("resolution::").to_string());
+            s.has_resolution = s.resolution.as_deref().is_some_and(|r| r != "Completed");
             s.metadata_ready = true;
             s.done_option_available = true;
             s.project_configured = true;
             s.in_project = true;
-            s.project_status = Some((*stages[0]).to_string());
-            if names.contains(&"workflow::Done") {
-                s.resolution = Some("Completed".into());
+            s.project_status = stage.map(|r| r.trim_start_matches("workflow::").to_string());
+            if s.resolution.as_deref() == Some("Completed") {
                 s.issue_reason = Some("completed".into());
             }
         }

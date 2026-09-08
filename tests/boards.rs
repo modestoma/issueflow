@@ -35,14 +35,12 @@ fn target() -> Target {
 fn labels() -> Value {
     Value::Array(
         [
-            "workflow::Backlog",
             "workflow::Ready",
             "workflow::In progress",
             "workflow::In review",
-            "workflow::Done",
-            "workflow::Cancelled",
             "needs-clarification",
             "blocked",
+            "resolution::Completed",
             "resolution::Cancelled",
             "resolution::Duplicate",
             "resolution::Invalid",
@@ -66,15 +64,15 @@ fn labels() -> Value {
 }
 fn lists() -> Value {
     Value::Array([
-        "workflow::Backlog", "workflow::Ready", "workflow::In progress",
-        "workflow::In review", "workflow::Done", "workflow::Cancelled",
+        "workflow::Ready", "workflow::In progress",
+        "workflow::In review",
     ].iter().enumerate().map(|(index, name)| json!({"id":index + 11,"position":index,"label":{"id":index + 1,"name":name}})).collect())
 }
 
-fn lists_with_positions(positions: [usize; 6]) -> Value {
+fn lists_with_positions(positions: [usize; 3]) -> Value {
     Value::Array([
-        "workflow::Backlog", "workflow::Ready", "workflow::In progress",
-        "workflow::In review", "workflow::Done", "workflow::Cancelled",
+        "workflow::Ready", "workflow::In progress",
+        "workflow::In review",
     ].iter().enumerate().map(|(index, name)| json!({"id":index + 11,"position":positions[index],"label":{"id":index + 1,"name":name}})).collect())
 }
 
@@ -153,7 +151,7 @@ async fn create_writes_once_and_reads_the_new_board_back() {
 
 #[tokio::test]
 async fn repeated_workflow_initialization_is_a_read_only_noop() {
-    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
+    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists(),"hide_backlog_list":false,"hide_closed_list":false});
     let mock = Mock {
         replies: Mutex::new(
             vec![
@@ -177,7 +175,7 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
     .await
     .unwrap();
     assert_eq!(result["changed"], false);
-    assert_eq!(result["workflow_lists"].as_array().unwrap().len(), 6);
+    assert_eq!(result["workflow_lists"].as_array().unwrap().len(), 3);
     assert!(
         mock.calls
             .lock()
@@ -189,7 +187,7 @@ async fn repeated_workflow_initialization_is_a_read_only_noop() {
 
 #[tokio::test]
 async fn targeted_workflow_initialization_uses_the_explicit_board_id() {
-    let board = json!({"id":9,"name":"Team Board","lists":lists()});
+    let board = json!({"id":9,"name":"Team Board","lists":lists(),"hide_backlog_list":false,"hide_closed_list":false});
     let mock = Mock {
         replies: Mutex::new(
             vec![
@@ -239,8 +237,8 @@ async fn invalid_explicit_board_stops_before_label_writes() {
 
 #[tokio::test]
 async fn misordered_workflow_lists_move_only_mismatches_to_zero_based_positions() {
-    let current = lists_with_positions([1, 0, 2, 3, 4, 5]);
-    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
+    let current = lists_with_positions([1, 0, 2]);
+    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists(),"hide_backlog_list":false,"hide_closed_list":false});
     let mock = Mock {
         replies: Mutex::new(
             vec![
@@ -282,9 +280,9 @@ async fn misordered_workflow_lists_move_only_mismatches_to_zero_based_positions(
 
 #[tokio::test]
 async fn creates_board_and_missing_workflow_lists_then_verifies() {
-    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists()});
+    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists(),"hide_backlog_list":false,"hide_closed_list":false});
     let mut replies = vec![labels(), labels(), json!([]), json!({"id":3}), json!([])];
-    replies.extend((0..6).map(|_| json!({"id":99})));
+    replies.extend((0..3).map(|_| json!({"id":99})));
     replies.extend([lists(), board, lists()]);
     let mock = Mock {
         replies: Mutex::new(replies.into()),
@@ -304,7 +302,7 @@ async fn creates_board_and_missing_workflow_lists_then_verifies() {
             .iter()
             .filter(|(method, _, _)| *method == Method::POST)
             .count(),
-        7
+        4
     );
     assert_eq!(calls[3].2.as_ref().unwrap()["name"], "Issueflow Workflow");
     let label_ids: Vec<_> = calls
@@ -312,7 +310,7 @@ async fn creates_board_and_missing_workflow_lists_then_verifies() {
         .filter(|(method, endpoint, _)| *method == Method::POST && endpoint.ends_with("/lists"))
         .map(|(_, _, body)| body.as_ref().unwrap()["label_id"].as_u64().unwrap())
         .collect();
-    assert_eq!(label_ids, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(label_ids, vec![1, 2, 3]);
 }
 
 #[tokio::test]
@@ -355,4 +353,78 @@ async fn board_commands_reject_github_before_api_access() {
     };
     assert!(service.list().await.is_err());
     assert!(mock.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn initialization_enables_native_lists_and_leaves_extra_lists_alone() {
+    let mut all = lists().as_array().unwrap().clone();
+    all.push(json!({"id":90,"position":3,"label":{"id":90,"name":"workflow::Backlog"}}));
+    let all = json!(all);
+    let hidden = json!({"id":3,"name":"Issueflow Workflow","lists":all,"hide_backlog_list":true,"hide_closed_list":true});
+    let mut visible = hidden.clone();
+    visible["hide_backlog_list"] = json!(false);
+    visible["hide_closed_list"] = json!(false);
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                labels(),
+                labels(),
+                json!([hidden.clone()]),
+                all.clone(),
+                all.clone(),
+                hidden,
+                json!({}),
+                visible,
+                all,
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let result = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow("Issueflow Workflow")
+    .await
+    .unwrap();
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["workflow_lists"].as_array().unwrap().len(), 3);
+    assert!(result.get("legacy_cleanup_required").is_none());
+    let calls = mock.calls.lock().unwrap();
+    let writes: Vec<_> = calls.iter().filter(|(m, _, _)| *m != Method::GET).collect();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].2,
+        Some(json!({"hide_backlog_list":false,"hide_closed_list":false}))
+    );
+}
+
+#[tokio::test]
+async fn hidden_native_lists_after_update_are_not_success() {
+    let board = json!({"id":3,"name":"Issueflow Workflow","lists":lists(),"hide_backlog_list":true,"hide_closed_list":false});
+    let mock = Mock {
+        replies: Mutex::new(
+            vec![
+                labels(),
+                labels(),
+                json!([board.clone()]),
+                lists(),
+                lists(),
+                board.clone(),
+                json!({}),
+                board,
+            ]
+            .into(),
+        ),
+        calls: Mutex::new(vec![]),
+    };
+    let error = Boards {
+        transport: &mock,
+        target: target(),
+    }
+    .init_workflow("Issueflow Workflow")
+    .await
+    .unwrap_err();
+    assert!(error.outcome_unknown);
 }

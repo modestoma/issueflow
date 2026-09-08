@@ -12,37 +12,63 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Stage {
-    Backlog,
+    Open,
     Ready,
     InProgress,
     InReview,
 }
-pub const WORKFLOW_STAGE_LABELS: [&str; 6] = [
-    "workflow::Backlog",
+pub const WORKFLOW_STAGE_LABELS: [&str; 3] = [
     "workflow::Ready",
     "workflow::In progress",
     "workflow::In review",
-    "workflow::Done",
-    "workflow::Cancelled",
 ];
-pub const LEGACY_WORKFLOW_STAGE_LABELS: [&str; 7] = [
-    "workflow::待复查",
-    "workflow::待明确",
-    "workflow::就绪",
-    "workflow::开发中",
-    "workflow::待验收",
-    "workflow::已完成",
-    "workflow::已终止",
+pub const RESOLUTION_LABELS: [&str; 4] = [
+    "resolution::Completed",
+    "resolution::Cancelled",
+    "resolution::Duplicate",
+    "resolution::Invalid",
 ];
 impl Stage {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> Option<&'static str> {
         match self {
-            Self::Backlog => "workflow::Backlog",
-            Self::Ready => "workflow::Ready",
-            Self::InProgress => "workflow::In progress",
-            Self::InReview => "workflow::In review",
+            Self::Open => None,
+            Self::Ready => Some("workflow::Ready"),
+            Self::InProgress => Some("workflow::In progress"),
+            Self::InReview => Some("workflow::In review"),
         }
     }
+}
+
+/// Validate the current GitLab contract without translating historical labels.
+/// Open issues may carry a resolution after an interrupted close operation.
+pub fn gitlab_metadata(names: &[String], closed: bool) -> Result<(Option<&str>, Option<&str>)> {
+    let stages: Vec<_> = names
+        .iter()
+        .filter(|s| s.starts_with("workflow::"))
+        .collect();
+    let resolutions: Vec<_> = names
+        .iter()
+        .filter(|s| s.starts_with("resolution::"))
+        .collect();
+    if stages.len() > 1
+        || stages
+            .iter()
+            .any(|s| !WORKFLOW_STAGE_LABELS.contains(&s.as_str()))
+        || (closed && !stages.is_empty())
+        || resolutions.len() > 1
+        || resolutions
+            .iter()
+            .any(|s| !RESOLUTION_LABELS.contains(&s.as_str()))
+    {
+        return Err(Error::new(
+            "conflict",
+            "Invalid GitLab stage or resolution metadata",
+        ));
+    }
+    Ok((
+        stages.first().map(|s| s.as_str()),
+        resolutions.first().map(|s| s.as_str()),
+    ))
 }
 #[derive(Clone, Copy, ValueEnum)]
 pub enum CloseReason {
@@ -514,30 +540,31 @@ impl Service<'_> {
     }
     async fn set_stage(
         &self,
-        stage: &str,
+        stage: Option<&str>,
         extra_add: Vec<String>,
         extra_remove: Vec<String>,
     ) -> Result<Value> {
         let current = self.raw_issue().await?;
         let mut remove: Vec<_> = labels(&current)?
             .into_iter()
-            .filter(|s| s.starts_with("workflow::") && s != stage)
+            .filter(|s| s.starts_with("workflow::") && Some(s.as_str()) != stage)
             .collect();
         remove.extend(extra_remove);
-        let mut add = vec![stage.to_string()];
+        let mut add: Vec<_> = stage.into_iter().map(String::from).collect();
         add.extend(extra_add);
-        let result = self.labels(add, remove).await?;
+        let result = if add.is_empty() && remove.is_empty() {
+            self.show().await?
+        } else {
+            self.labels(add, remove).await?
+        };
         let actual = labels(&result)?;
         if actual
             .iter()
             .filter(|s| s.starts_with("workflow::"))
             .count()
-            != 1
+            != usize::from(stage.is_some())
         {
-            return Err(Error::new(
-                "conflict",
-                "出现多个阶段标记，需重新核对远端状态",
-            ));
+            return Err(Error::new("conflict", "阶段读回不一致，需重新核对远端状态"));
         }
         Ok(result)
     }
@@ -576,64 +603,20 @@ impl Service<'_> {
                 ));
             }
         }
-        let stages: Vec<_> = current_labels
-            .iter()
-            .filter(|name| {
-                WORKFLOW_STAGE_LABELS.contains(&name.as_str())
-                    || LEGACY_WORKFLOW_STAGE_LABELS.contains(&name.as_str())
-            })
-            .collect();
-        if stages.len() != 1 {
-            return Err(Error::new(
-                "conflict",
-                "GitLab issue must have exactly one canonical or legacy workflow stage",
-            ));
-        }
-        let (stage, clarification) = match stages[0].as_str() {
-            "workflow::待复查" => ("workflow::Backlog", false),
-            "workflow::待明确" => ("workflow::Backlog", true),
-            "workflow::就绪" => ("workflow::Ready", false),
-            "workflow::开发中" => ("workflow::In progress", false),
-            "workflow::待验收" => ("workflow::In review", false),
-            "workflow::已完成" => ("workflow::Done", false),
-            "workflow::已终止" => ("workflow::Cancelled", false),
-            value => (
-                value,
-                current_labels
-                    .iter()
-                    .any(|label| label == "needs-clarification"),
-            ),
-        };
-        let mut add = BTreeSet::from([stage.to_string()]);
-        let mut remove: BTreeSet<String> = current_labels
-            .iter()
-            .filter(|label| LEGACY_WORKFLOW_STAGE_LABELS.contains(&label.as_str()))
-            .cloned()
-            .collect();
-        if clarification {
-            add.insert("needs-clarification".into());
-        }
-        for (legacy, canonical) in [
-            ("resolution::取消", "resolution::Cancelled"),
-            ("resolution::重复", "resolution::Duplicate"),
-            ("resolution::失效", "resolution::Invalid"),
-        ] {
-            if current_labels.iter().any(|label| label == legacy) {
-                remove.insert(legacy.into());
-                add.insert(canonical.into());
-            }
-        }
+        gitlab_metadata(&current_labels, current["state"] == "closed")?;
+        let mut add = BTreeSet::new();
+        let mut remove = BTreeSet::new();
         let dependencies = self.dependencies().await?;
         let blockers = dependencies
             .as_array()
             .ok_or_else(|| Error::new("response", "Invalid dependency response"))?;
         let unresolved = blockers.iter().any(|blocker| {
-            let labels = blocker["labels"].as_array();
-            blocker["state"] == "opened"
-                || !labels.is_some_and(|labels| {
-                    labels
-                        .iter()
-                        .any(|label| label.as_str() == Some("workflow::Done"))
+            blocker["state"] != "closed"
+                || labels(blocker).ok().is_none_or(|names| {
+                    !matches!(
+                        gitlab_metadata(&names, true),
+                        Ok((None, Some("resolution::Completed")))
+                    )
                 })
         });
         if unresolved {
@@ -692,58 +675,69 @@ impl Service<'_> {
             .filter(|s| s.starts_with("resolution::"))
             .collect();
         let resolution = match reason {
-            CloseReason::Completed => None,
-            CloseReason::Cancelled => Some("resolution::Cancelled"),
-            CloseReason::Duplicate => Some("resolution::Duplicate"),
-            CloseReason::Invalid => Some("resolution::Invalid"),
+            CloseReason::Completed => "resolution::Completed",
+            CloseReason::Cancelled => "resolution::Cancelled",
+            CloseReason::Duplicate => "resolution::Duplicate",
+            CloseReason::Invalid => "resolution::Invalid",
         };
         let removes = old_resolutions
             .into_iter()
-            .filter(|s| Some(s.as_str()) != resolution)
+            .filter(|s| s != resolution)
             .collect();
-        self.set_stage(
-            if resolution.is_none() {
-                "workflow::Done"
-            } else {
-                "workflow::Cancelled"
-            },
-            resolution.into_iter().map(String::from).collect(),
-            removes,
-        )
-        .await?;
-        let payload = if self.gh() {
-            json!({"state":"closed", "state_reason": if matches!(reason, CloseReason::Completed) { "completed" } else { "not_planned" }})
-        } else {
-            json!({"state_event":"close"})
-        };
-        let result = self
-            .transport
-            .request(self.edit_method(), &self.target.endpoint()?, Some(payload))
+        self.set_stage(None, vec![resolution.into()], removes)
+            .await?;
+        self.transport
+            .request(
+                Method::PUT,
+                &self.target.endpoint()?,
+                Some(json!({"state_event":"close"})),
+            )
             .await
             .map_err(partial)?;
-        normalize(&result, self.target.platform)
+        let result = self.show().await.map_err(partial)?;
+        let names = labels(&result)?;
+        let (stage, actual_resolution) = gitlab_metadata(&names, true).map_err(partial)?;
+        if result["state"] != "closed" || stage.is_some() || actual_resolution != Some(resolution) {
+            return Err(partial(Error::new(
+                "conflict",
+                "GitLab closure readback differs",
+            )));
+        }
+        Ok(result)
     }
     pub async fn reopen(&self) -> Result<Value> {
         if self.gh() {
             return self.native_state(None).await;
         }
         self.raw_issue().await?;
-        let payload = if self.gh() {
-            json!({"state":"open"})
-        } else {
-            json!({"state_event":"reopen"})
-        };
         self.transport
-            .request(self.edit_method(), &self.target.endpoint()?, Some(payload))
+            .request(
+                Method::PUT,
+                &self.target.endpoint()?,
+                Some(json!({"state_event":"reopen"})),
+            )
             .await?;
         let current = self.raw_issue().await.map_err(partial)?;
         let remove = labels(&current)?
             .into_iter()
             .filter(|s| s.starts_with("resolution::"))
             .collect();
-        self.set_stage("workflow::Backlog", vec![], remove)
+        let result = self
+            .set_stage(None, vec![], remove)
             .await
-            .map_err(partial)
+            .map_err(partial)?;
+        let names = labels(&result)?;
+        if result["state"] != "open"
+            || names
+                .iter()
+                .any(|s| s.starts_with("resolution::") || s.starts_with("workflow::"))
+        {
+            return Err(partial(Error::new(
+                "conflict",
+                "GitLab reopen readback differs",
+            )));
+        }
+        Ok(result)
     }
     pub async fn setup_labels(&self) -> Result<Value> {
         if self.gh() {
@@ -759,14 +753,12 @@ impl Service<'_> {
         let existing = self.pages(&endpoint).await?;
         let mut created = Vec::new();
         for name in [
-            "workflow::Backlog",
             "workflow::Ready",
             "workflow::In progress",
             "workflow::In review",
-            "workflow::Done",
-            "workflow::Cancelled",
             "needs-clarification",
             "blocked",
+            "resolution::Completed",
             "resolution::Cancelled",
             "resolution::Duplicate",
             "resolution::Invalid",

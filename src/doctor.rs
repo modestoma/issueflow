@@ -128,8 +128,11 @@ fn gitlab_board_readiness(
         .filter(|name| !lists.contains(**name))
         .copied()
         .collect();
+    let native_lists_visible =
+        board.is_some_and(|b| b["hide_backlog_list"] == false && b["hide_closed_list"] == false);
     json!({
-        "ready": missing_labels.is_empty() && matching_boards == 1 && missing_lists.is_empty(),
+        "ready": missing_labels.is_empty() && matching_boards == 1 && missing_lists.is_empty() && native_lists_visible,
+        "native_lists_visible": native_lists_visible,
         "board_name": board_name,
         "matching_boards": matching_boards,
         "missing_labels": missing_labels,
@@ -320,7 +323,33 @@ mod tests {
         let board = json!({"lists":[]});
         let result = gitlab_board_readiness(&labels, &boards, Some(&board), "Issueflow Workflow");
         assert_eq!(result["ready"], false);
-        assert_eq!(result["missing_lists"].as_array().unwrap().len(), 6);
+        assert_eq!(result["missing_lists"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gitlab_readiness_requires_visible_native_endpoints() {
+        let labels: Vec<_> = WORKFLOW_STAGE_LABELS
+            .iter()
+            .map(|name| json!({"name":name}))
+            .collect();
+        let boards = json!([{"id":1,"name":"Issueflow Workflow"}]);
+        let lists: Vec<_> = WORKFLOW_STAGE_LABELS
+            .iter()
+            .map(|name| json!({"label":{"name":name}}))
+            .collect();
+        let mut board = json!({"lists":lists,"hide_backlog_list":false,"hide_closed_list":false});
+        assert_eq!(
+            gitlab_board_readiness(&labels, &boards, Some(&board), "Issueflow Workflow")["ready"],
+            true
+        );
+        for flag in ["hide_backlog_list", "hide_closed_list"] {
+            board[flag] = json!(true);
+            assert_eq!(
+                gitlab_board_readiness(&labels, &boards, Some(&board), "Issueflow Workflow")["ready"],
+                false
+            );
+            board[flag] = json!(false);
+        }
     }
 
     #[tokio::test]
