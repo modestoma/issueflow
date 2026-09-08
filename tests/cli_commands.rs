@@ -72,3 +72,20 @@ fn public_help_uses_cross_platform_pr_and_hides_workflow() {
             .any(|line| line.trim_start().starts_with("workflow "))
     );
 }
+
+#[test]
+fn gitlab_transition_help_uses_native_open_without_backlog_alias() {
+    let help = run(&["issue", "transition", "--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("open"));
+    assert!(!text.contains("backlog"));
+    let invalid = run(&[
+        "issue",
+        "transition",
+        "https://gitlab.example/a/b/-/issues/1",
+        "--to",
+        "backlog",
+    ]);
+    assert!(!invalid.status.success());
+}

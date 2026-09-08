@@ -166,7 +166,7 @@ fn gitlab_issue() -> Value {
     json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","state":"opened","labels":["type::feature","priority::P1","workflow::In review"]})
 }
 fn gitlab_completed_issue() -> Value {
-    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"closed","labels":["type::feature","priority::P1","workflow::Done"]})
+    json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"closed","labels":["type::feature","priority::P1","resolution::Completed"]})
 }
 fn gitlab_mr() -> Value {
     json!({"id":2,"iid":2,"web_url":"https://gitlab.example/group/sub/repo/-/merge_requests/2","state":"merged","merged_at":"now","draft":false,"sha":"a".repeat(40),"source_branch":"feat/change","target_branch":"main","source_project_id":7,"target_project_id":7,"merge_commit_sha":"b".repeat(40),"description":"Refs https://gitlab.example/group/sub/repo/-/issues/1"})
@@ -290,7 +290,7 @@ async fn gitlab_acceptance_policy_never_closes_from_merge_alone() {
 #[tokio::test]
 async fn gitlab_apply_closes_once_after_expected_head_and_reads_back() {
     let completed = gitlab_completed_issue();
-    let completed_open = json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"opened","labels":["type::feature","priority::P1","workflow::Done"]});
+    let completed_open = json!({"id":1,"iid":1,"web_url":"https://gitlab.example/group/sub/repo/-/issues/1","title":"Issue","description":"Body","created_at":"now","updated_at":"now","state":"opened","labels":["type::feature","priority::P1","resolution::Completed"]});
     let mut steps = vec![
         (Method::GET, gitlab_issue()),
         (Method::GET, gitlab_mr()),
@@ -308,6 +308,7 @@ async fn gitlab_apply_closes_once_after_expected_head_and_reads_back() {
         (Method::PUT, json!({})),
         (Method::GET, completed_open),
         (Method::PUT, completed.clone()),
+        (Method::GET, completed.clone()),
     ]);
     steps.extend([
         (Method::GET, completed),
@@ -707,4 +708,84 @@ async fn unknown_done_write_recovers_without_repeating_mutation() {
     assert_eq!(result["applied"], false);
     assert_eq!(result["snapshot"]["project_status"], "Done");
     assert_eq!(m.writes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn gitlab_recovery_distinguishes_closed_outcomes_and_interrupted_close() {
+    for (state, resolution, phase, actions) in [
+        ("closed", None, "manual_review", json!([])),
+        (
+            "closed",
+            Some("resolution::Cancelled"),
+            "manual_review",
+            json!([]),
+        ),
+        (
+            "closed",
+            Some("resolution::Duplicate"),
+            "manual_review",
+            json!([]),
+        ),
+        (
+            "closed",
+            Some("resolution::Invalid"),
+            "manual_review",
+            json!([]),
+        ),
+        (
+            "closed",
+            Some("resolution::Completed"),
+            "complete",
+            json!([]),
+        ),
+        (
+            "opened",
+            Some("resolution::Completed"),
+            "reconciliation_needed",
+            json!(["close_issue"]),
+        ),
+        (
+            "opened",
+            None,
+            "reconciliation_needed",
+            json!(["close_issue"]),
+        ),
+    ] {
+        let mut issue = gitlab_completed_issue();
+        issue["state"] = json!(state);
+        issue["labels"] = json!(resolution.into_iter().collect::<Vec<_>>());
+        let m = Mock {
+            steps: Mutex::new(
+                vec![
+                    (Method::GET, issue),
+                    (Method::GET, gitlab_mr()),
+                    (Method::GET, gitlab_target_refs()),
+                ]
+                .into(),
+            ),
+            calls: Mutex::new(vec![]),
+        };
+        let cfg = gitlab_cfg();
+        let c = gitlab_contract();
+        let w = gitlab_workflow("merged");
+        let v = Recovery {
+            config: &cfg,
+            transport: &m,
+            contract: &c,
+            parent: None,
+            workflow: &w,
+        }
+        .reconcile(false, false, None)
+        .await
+        .unwrap();
+        assert_eq!(v["plan"]["phase"], phase, "{state} {resolution:?}");
+        assert_eq!(v["plan"]["actions"], actions);
+        assert!(
+            m.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, _)| *method == Method::GET)
+        );
+    }
 }

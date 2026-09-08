@@ -1,7 +1,7 @@
 use crate::{
     config::Platform,
     error::{Error, Result},
-    service::{LEGACY_WORKFLOW_STAGE_LABELS, Service, WORKFLOW_STAGE_LABELS},
+    service::{Service, WORKFLOW_STAGE_LABELS},
     target::{Target, encode},
     transport::Transport,
 };
@@ -216,7 +216,26 @@ impl Boards<'_> {
                 changed = true;
             }
         }
-        let final_board = self.show(board_id).await.map_err(unknown)?;
+        let mut final_board = self.show(board_id).await.map_err(unknown)?;
+        if final_board["hide_backlog_list"] != false || final_board["hide_closed_list"] != false {
+            self.transport
+                .request(
+                    Method::PUT,
+                    &format!("{}/{board_id}", self.root()?),
+                    Some(json!({"hide_backlog_list":false,"hide_closed_list":false})),
+                )
+                .await
+                .map_err(unknown)?;
+            changed = true;
+            final_board = self.show(board_id).await.map_err(unknown)?;
+            if final_board["hide_backlog_list"] != false || final_board["hide_closed_list"] != false
+            {
+                return Err(unknown(Error::new(
+                    "conflict",
+                    "Native Open and Closed lists are not visibly enabled",
+                )));
+            }
+        }
         let final_lists = self.service().pages(&lists_root).await.map_err(unknown)?;
         for (index, label) in WORKFLOW_STAGE_LABELS.iter().enumerate() {
             if final_lists
@@ -234,22 +253,10 @@ impl Boards<'_> {
                 )));
             }
         }
-        let legacy_lists: Vec<_> = final_lists
-            .iter()
-            .filter(|list| {
-                list["label"]["name"]
-                    .as_str()
-                    .is_some_and(|name| LEGACY_WORKFLOW_STAGE_LABELS.contains(&name))
-            })
-            .cloned()
-            .collect();
-        let legacy_cleanup_required = !legacy_lists.is_empty();
         Ok(json!({
             "changed":changed,
             "board":final_board,
-            "workflow_lists":final_lists.iter().filter(|list| list["label"]["name"].as_str().is_some_and(|name| WORKFLOW_STAGE_LABELS.contains(&name))).cloned().collect::<Vec<_>>(),
-            "legacy_lists":legacy_lists,
-            "legacy_cleanup_required":legacy_cleanup_required
+            "workflow_lists":final_lists.iter().filter(|list| list["label"]["name"].as_str().is_some_and(|name| WORKFLOW_STAGE_LABELS.contains(&name))).cloned().collect::<Vec<_>>()
         }))
     }
 }

@@ -59,7 +59,7 @@ To create a GitLab Task that can become a native child item, set the native type
 {
   "title": "Implement the child change",
   "body": "Parent and delivery contract: …",
-  "labels": ["workflow::Backlog", "type::chore", "priority::P2"],
+  "labels": ["type::chore", "priority::P2"],
   "issue_type": "task"
 }
 ```
@@ -97,16 +97,11 @@ issueflow issue close https://gitlab.example.com/group/repo/-/issues/42 --reason
 issueflow issue reopen https://gitlab.example.com/group/repo/-/issues/42
 ```
 
-GitLab uses the same six-stage model as GitHub: Backlog, Ready, In progress, In review, Done, and Cancelled. Open transitions support backlog, ready, in-progress, and in-review; close reasons are completed/cancelled/duplicate/invalid, with canonical workflow/resolution label maintenance. Clarification is the orthogonal `needs-clarification` label. Reopening returns to Backlog and clears the previous resolution. `--no-workflow-labels` retains its explicit native-only behavior. No command grants merge or acceptance authorization.
+GitLab uses native **Open → Ready → In progress → In review → Closed** lists. Only the three active stages have workflow labels. New and unprocessed issues are open without a stage label; `issue transition ISSUE_URL --to open` clears the stage, while `ready`, `in-progress`, and `in-review` select an active stage. There is no `backlog` alias. Clarification remains the orthogonal `needs-clarification` label.
 
-Existing installations can inspect one GitLab issue at a time before migrating legacy labels:
+Closing clears stage labels and writes exactly one `resolution::Completed`, `resolution::Cancelled`, `resolution::Duplicate`, or `resolution::Invalid` label before closing the native issue, then reads back the result. Reopening clears stage and resolution labels and returns to native Open. `--no-workflow-labels` retains explicit native-only behavior. Closed without a known outcome is not successful delivery; acceptance and verified MR delivery still apply.
 
-```sh
-issueflow issue reconcile-metadata ISSUE_URL
-issueflow issue reconcile-metadata ISSUE_URL --apply
-```
-
-The command maps the seven legacy Chinese workflow labels to the six canonical stages, preserves clarification separately, maps legacy resolution labels to English values, and derives `blocked` from native blocking relationships. Preview is the default. Apply performs one targeted label update with readback; ambiguous or mixed stages stop without writing. Repository-wide migration and legacy label/list deletion are intentionally not automatic.
+`issue reconcile-metadata ISSUE_URL [--apply]` validates the current GitLab stage/resolution contract and derives `blocked` from native blocking relationships. Preview is the default. Apply changes only the derived blocked label with readback. A blocker is unresolved unless closed with an unambiguous Completed outcome; Agents must also verify acceptance and that the required deliverable is usable. No historical stage/resolution translation, compatibility aliases, or board/issue migration is provided. Users remove obsolete board lists themselves.
 
 ## Cross-platform Kanban
 
@@ -126,7 +121,7 @@ issueflow --platform gitlab --repository group/repo kanban init
 issueflow --platform gitlab --repository group/repo kanban init 3
 ```
 
-`kanban create` reuses a unique exact-name board or creates it and reads it back. `kanban init` uses the default name `Issueflow Workflow`; override it with `--name`, or provide an explicit positive board ID to initialize that existing board. Initialization ensures all workflow labels, adds only missing label lists, orders the six canonical workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Legacy columns are reported as `legacy_lists` with `legacy_cleanup_required=true`; they are not silently deleted. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name or board ID rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. GitLab does not provide parity for Project items, arbitrary fields, repository links, or Project Status through this facade; those subcommands fail before API access. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
+`kanban create` reuses a unique exact-name board or creates it and reads it back. `kanban init` uses the default name `Issueflow Workflow`; override it with `--name`, or provide an explicit positive board ID to initialize that existing board. Initialization ensures all workflow labels, adds only missing label lists, orders the three active workflow columns, and reads the final board and lists back. Repeating a completed initialization is a read-only no-op. Ambiguous boards or duplicate workflow lists stop without deletion. Native Open and Closed are made visible and verified using the board visibility flags (the lists API does not return these two built-in lists). Existing unrelated or obsolete lists are left untouched and do not trigger a migration requirement. Do not add type/priority lists to the workflow board: they would take unprocessed issues out of Open. Multi-step writes are not transactional, so an unknown outcome must be inspected and resumed with the same name or board ID rather than creating another board. These project-level label lists are the cross-tier compatibility target; the command does not depend on Premium-only native status lists or manage group boards. GitLab does not provide parity for Project items, arbitrary fields, repository links, or Project Status through this facade; those subcommands fail before API access. See the [GitLab Issue Boards guide](https://docs.gitlab.com/user/project/issue_board/) and [Boards API](https://docs.gitlab.com/api/boards/).
 
 ### Dependencies
 

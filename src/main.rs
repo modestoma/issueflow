@@ -434,7 +434,7 @@ enum IssueCommand {
         #[arg(long)]
         parent: Option<String>,
     },
-    /// Preview or apply canonical GitLab workflow metadata migration
+    /// Validate GitLab workflow metadata and reconcile blocked status
     ReconcileMetadata {
         url: String,
         #[arg(long)]
@@ -497,7 +497,7 @@ enum IssueCommand {
         #[arg(long)]
         no_workflow_labels: bool,
     },
-    /// Reopen an issue; GitLab also restores the Backlog stage
+    /// Reopen an issue; GitLab clears stage and resolution labels
     Reopen {
         url: String,
         #[arg(long)]

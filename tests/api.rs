@@ -707,7 +707,7 @@ async fn gitlab_transition_preserves_team_label_and_single_stage() {
 async fn closing_completed_maps_labels_and_platform_state() {
     let path = "projects/group%2Fsub%2Frepo/issues/2";
     let initial = issue(Platform::Gitlab, &["workflow::In review", "team::a"]);
-    let labeled = issue(Platform::Gitlab, &["workflow::Done", "team::a"]);
+    let labeled = issue(Platform::Gitlab, &["resolution::Completed", "team::a"]);
     let mut closed = labeled.clone();
     closed["state"] = json!("closed");
     let mock = Mock::new(vec![
@@ -717,7 +717,9 @@ async fn closing_completed_maps_labels_and_platform_state() {
         step(
             Method::PUT,
             path,
-            Some(json!({"add_labels":"workflow::Done","remove_labels":"workflow::In review"})),
+            Some(
+                json!({"add_labels":"resolution::Completed","remove_labels":"workflow::In review"}),
+            ),
             labeled.clone(),
         ),
         step(Method::GET, path, None, labeled),
@@ -725,8 +727,9 @@ async fn closing_completed_maps_labels_and_platform_state() {
             Method::PUT,
             path,
             Some(json!({"state_event":"close"})),
-            closed,
+            closed.clone(),
         ),
+        step(Method::GET, path, None, closed),
     ]);
     assert_eq!(
         Service {
@@ -743,13 +746,10 @@ async fn closing_completed_maps_labels_and_platform_state() {
 #[tokio::test]
 async fn reopening_clears_resolution_and_returns_to_triage() {
     let path = "projects/group%2Fsub%2Frepo/issues/2";
-    let opened = issue(
-        Platform::Gitlab,
-        &["workflow::Cancelled", "resolution::Cancelled", "team::a"],
-    );
+    let opened = issue(Platform::Gitlab, &["resolution::Cancelled", "team::a"]);
     let mut closed = opened.clone();
     closed["state"] = json!("closed");
-    let triage = issue(Platform::Gitlab, &["workflow::Backlog", "team::a"]);
+    let triage = issue(Platform::Gitlab, &["team::a"]);
     let mock = Mock::new(vec![
         step(Method::GET, path, None, closed),
         step(
@@ -764,9 +764,7 @@ async fn reopening_clears_resolution_and_returns_to_triage() {
         step(
             Method::PUT,
             path,
-            Some(
-                json!({"add_labels":"workflow::Backlog","remove_labels":"workflow::Cancelled,resolution::Cancelled"}),
-            ),
+            Some(json!({"add_labels":"","remove_labels":"resolution::Cancelled"})),
             triage.clone(),
         ),
         step(Method::GET, path, None, triage),
@@ -778,7 +776,7 @@ async fn reopening_clears_resolution_and_returns_to_triage() {
     .reopen()
     .await
     .unwrap();
-    assert_eq!(result["labels"], json!(["workflow::Backlog", "team::a"]));
+    assert_eq!(result["labels"], json!(["team::a"]));
 }
 
 #[tokio::test]
@@ -837,21 +835,8 @@ async fn gitlab_removes_link_id_not_issue_id() {
 }
 
 #[tokio::test]
-async fn gitlab_metadata_migration_previews_canonical_stage_resolution_and_blocked() {
-    let current = issue(
-        Platform::Gitlab,
-        &[
-            "workflow::待明确",
-            "resolution::取消",
-            "type::feature",
-            "priority::P1",
-        ],
-    );
-    let blocker = json!({
-        "id":44,"iid":4,"link_type":"is_blocked_by","state":"opened",
-        "web_url":"https://gitlab.example/group/sub/repo/-/issues/4",
-        "labels":["workflow::In progress"]
-    });
+async fn gitlab_metadata_previews_blocked_without_stage_for_unprocessed_issue() {
+    let current = issue(Platform::Gitlab, &["type::feature", "priority::P1"]);
     let endpoint = "projects/group%2Fsub%2Frepo/issues/2";
     let mock = Mock::new(vec![
         step(Method::GET, endpoint, None, current.clone()),
@@ -860,7 +845,7 @@ async fn gitlab_metadata_migration_previews_canonical_stage_resolution_and_block
             Method::GET,
             "projects/group%2Fsub%2Frepo/issues/2/links?per_page=100&page=1",
             None,
-            json!([blocker]),
+            json!([{"id":44,"iid":4,"link_type":"is_blocked_by","state":"closed","web_url":"https://gitlab.example/group/sub/repo/-/issues/4","labels":["resolution::Cancelled"]}]),
         ),
     ]);
     let result = Service {
@@ -871,41 +856,22 @@ async fn gitlab_metadata_migration_previews_canonical_stage_resolution_and_block
     .await
     .unwrap();
     assert_eq!(result["applied"], false);
-    let add = result["add"].as_array().unwrap();
-    for label in [
-        "workflow::Backlog",
-        "needs-clarification",
-        "resolution::Cancelled",
-        "blocked",
-    ] {
-        assert!(add.contains(&json!(label)), "{result}");
-    }
-    assert!(
-        result["remove"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("workflow::待明确"))
-    );
-    assert!(
-        result["remove"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("resolution::取消"))
-    );
+    assert_eq!(result["add"], json!(["blocked"]));
+    assert_eq!(result["remove"], json!([]));
 }
 
 #[tokio::test]
-async fn gitlab_metadata_migration_applies_once_and_clears_stale_blocked() {
+async fn gitlab_metadata_applies_once_and_clears_stale_blocked() {
     let current = issue(
         Platform::Gitlab,
         &[
-            "workflow::待验收",
+            "workflow::In review",
             "blocked",
             "type::feature",
             "priority::P1",
         ],
     );
-    let migrated = issue(
+    let updated = issue(
         Platform::Gitlab,
         &["workflow::In review", "type::feature", "priority::P1"],
     );
@@ -923,13 +889,10 @@ async fn gitlab_metadata_migration_applies_once_and_clears_stale_blocked() {
         step(
             Method::PUT,
             endpoint,
-            Some(json!({
-                "add_labels":"workflow::In review",
-                "remove_labels":"blocked,workflow::待验收"
-            })),
+            Some(json!({"add_labels":"","remove_labels":"blocked"})),
             json!({}),
         ),
-        step(Method::GET, endpoint, None, migrated),
+        step(Method::GET, endpoint, None, updated),
     ]);
     let result = Service {
         transport: &mock,
@@ -958,4 +921,126 @@ async fn unknown_input_fields_and_empty_edits_are_rejected() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn gitlab_open_transition_clears_stage_and_preserves_other_labels() {
+    let path = "projects/group%2Fsub%2Frepo/issues/2";
+    let initial = issue(
+        Platform::Gitlab,
+        &["workflow::Ready", "team::a", "needs-clarification"],
+    );
+    let updated = issue(Platform::Gitlab, &["team::a", "needs-clarification"]);
+    let mock = Mock::new(vec![
+        step(Method::GET, path, None, initial.clone()),
+        step(Method::GET, path, None, initial.clone()),
+        step(Method::GET, path, None, initial),
+        step(
+            Method::PUT,
+            path,
+            Some(json!({"add_labels":"","remove_labels":"workflow::Ready"})),
+            updated.clone(),
+        ),
+        step(Method::GET, path, None, updated),
+    ]);
+    let result = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .transition(Stage::Open)
+    .await
+    .unwrap();
+    assert_eq!(result["state"], "open");
+    assert_eq!(result["labels"], json!(["team::a", "needs-clarification"]));
+}
+
+#[tokio::test]
+async fn gitlab_open_transition_without_stage_is_read_only() {
+    let path = "projects/group%2Fsub%2Frepo/issues/2";
+    let initial = issue(Platform::Gitlab, &["team::a"]);
+    let mock = Mock::new(vec![
+        step(Method::GET, path, None, initial.clone()),
+        step(Method::GET, path, None, initial.clone()),
+        step(Method::GET, path, None, initial),
+    ]);
+    let result = Service {
+        transport: &mock,
+        target: target(Platform::Gitlab),
+    }
+    .transition(Stage::Open)
+    .await
+    .unwrap();
+    assert_eq!(result["labels"], json!(["team::a"]));
+}
+
+#[tokio::test]
+async fn gitlab_close_records_each_reason_and_rejects_failed_native_readback() {
+    for (reason, resolution) in [
+        (CloseReason::Completed, "resolution::Completed"),
+        (CloseReason::Cancelled, "resolution::Cancelled"),
+        (CloseReason::Duplicate, "resolution::Duplicate"),
+        (CloseReason::Invalid, "resolution::Invalid"),
+    ] {
+        for native_closed in [true, false] {
+            let path = "projects/group%2Fsub%2Frepo/issues/2";
+            let initial = issue(Platform::Gitlab, &["workflow::In review", "team::a"]);
+            let labeled = issue(Platform::Gitlab, &[resolution, "team::a"]);
+            let mut result = labeled.clone();
+            if native_closed {
+                result["state"] = json!("closed");
+            }
+            let mock = Mock::new(vec![
+                step(Method::GET, path, None, initial.clone()),
+                step(Method::GET, path, None, initial.clone()),
+                step(Method::GET, path, None, initial),
+                step(
+                    Method::PUT,
+                    path,
+                    Some(json!({"add_labels":resolution,"remove_labels":"workflow::In review"})),
+                    labeled.clone(),
+                ),
+                step(Method::GET, path, None, labeled),
+                step(
+                    Method::PUT,
+                    path,
+                    Some(json!({"state_event":"close"})),
+                    json!({}),
+                ),
+                step(Method::GET, path, None, result),
+            ]);
+            let result = Service {
+                transport: &mock,
+                target: target(Platform::Gitlab),
+            }
+            .close(reason)
+            .await;
+            if native_closed {
+                let result = result.unwrap();
+                assert_eq!(result["state"], "closed");
+                assert_eq!(result["labels"], json!([resolution, "team::a"]));
+            } else {
+                assert!(result.unwrap_err().outcome_unknown);
+            }
+        }
+    }
+}
+
+#[test]
+fn gitlab_metadata_accepts_endpoints_and_rejects_ambiguous_outcomes() {
+    use issueflow::service::gitlab_metadata;
+    let strings = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert!(gitlab_metadata(&[], false).is_ok());
+    assert!(gitlab_metadata(&[], true).is_ok()); // Unknown closure is left for delivery review.
+    assert!(gitlab_metadata(&strings(&["resolution::Completed"]), true).is_ok());
+    for names in [
+        vec!["workflow::Backlog"],
+        vec!["workflow::Done"],
+        vec!["workflow::Cancelled"],
+        vec!["workflow::待验收"],
+        vec!["workflow::Ready", "workflow::In review"],
+        vec!["resolution::Completed", "resolution::Cancelled"],
+    ] {
+        assert!(gitlab_metadata(&strings(&names), false).is_err());
+    }
+    assert!(gitlab_metadata(&strings(&["workflow::In review"]), true).is_err());
 }
