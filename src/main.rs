@@ -34,6 +34,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize and inspect local roadmap plans without platform access
+    #[command(subcommand)]
+    Roadmap(RoadmapCommand),
     /// Manage project milestones and Issue membership
     #[command(subcommand)]
     Milestone(MilestoneCommand),
@@ -80,6 +83,49 @@ enum Command {
     /// Deprecated compatibility alias for delivery and configuration validation
     #[command(subcommand, hide = true)]
     Workflow(DeliveryCommand),
+}
+
+#[derive(Subcommand)]
+enum RoadmapCommand {
+    /// Create a draft in REPO/.agents/roadmaps/ID without overwriting
+    Init {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        title: String,
+    },
+    /// Validate local records and the dependency graph
+    Validate { directory: PathBuf },
+    /// List advisory dispatch candidates; does not claim or start tasks
+    Ready { directory: PathBuf },
+    /// List affected tasks and their transitive dependents
+    Impact {
+        directory: PathBuf,
+        #[arg(long, num_args = 1.., required = true)]
+        tasks: Vec<String>,
+    },
+}
+
+fn roadmap_command(command: &RoadmapCommand) -> Result<Value> {
+    use issueflow::roadmap::{self, Plan};
+    match command {
+        RoadmapCommand::Init {
+            repo,
+            id,
+            base,
+            title,
+        } => roadmap::init(repo, id, base, title),
+        RoadmapCommand::Validate { directory } => {
+            let plan = Plan::load(directory)?;
+            Ok(json!({"valid":true,"tasks":plan.tasks.len(),"revision":plan.revision}))
+        }
+        RoadmapCommand::Ready { directory } => Plan::load(directory)?.ready(),
+        RoadmapCommand::Impact { directory, tasks } => Plan::load(directory)?.impact(tasks),
+    }
 }
 
 #[derive(Subcommand)]
@@ -282,6 +328,7 @@ fn capabilities() -> Value {
         "scope": "installed_support",
         "configured_platform": Value::Null,
         "remote_permissions_checked": false,
+        "local": {"roadmaps": "init/validate/ready/impact; offline"},
         "platforms": {
             "github": {
                 "issues": "supported",
@@ -1451,6 +1498,9 @@ async fn main() -> ExitCode {
     match &cli.command {
         Command::Capabilities => {
             return finish(Ok(capabilities()), output);
+        }
+        Command::Roadmap(command) => {
+            return finish(roadmap_command(command), output);
         }
         Command::Delivery(DeliveryCommand::ValidateContract { file, parent_file })
         | Command::Workflow(DeliveryCommand::ValidateContract { file, parent_file }) => {

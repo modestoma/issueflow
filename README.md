@@ -471,3 +471,20 @@ issueflow --platform github --repository OWNER/REPO milestone close 3 --expected
 Milestone mutations preview without `--apply`. Input JSON accepts only `title` and `description`; creation requires a nonempty title. Update/close compare the latest editable fields and identity against the raw `--json milestone show` snapshot in `--expected-file`. This is an optimistic check, not an atomic server lock. Writes are read back; readback failures are reported as unknown outcomes.
 
 Create persists a UUID marker for recovery and reuses a unique match. After an unknown create, query the marker before any retry; absence is not proof that creation failed. Do not change UUID to bypass uncertain results. Bind rejects existing membership in a different milestone. Closing requires a reference to actual user acceptance; the argument itself does not grant approval. Group milestones are not supported.
+
+## Offline Roadmap Plans
+
+`roadmap init/validate/ready/impact` runs locally before platform configuration, environment files or credentials are read. The executable embeds its initialization templates; no scripting runtime is required.
+
+```sh
+issueflow roadmap init --repo /path/to/repo --id export-v1 --base develop --title 'Export v1'
+issueflow roadmap validate /path/to/repo/.agents/roadmaps/export-v1
+issueflow roadmap ready /path/to/repo/.agents/roadmaps/export-v1
+issueflow roadmap impact /path/to/repo/.agents/roadmaps/export-v1 --tasks api-contract
+```
+
+Initialization requires a Git repository root and refuses existing or symlinked roadmap directories. It writes `roadmap.md`, `decisions.md`, `acceptance.md`, `plan.json` and an `issues/` directory under `.agents/roadmaps/ID`. It does not create branches, commit, or contact a platform. The remaining commands are read-only and validate the plan and contained document paths before computing results.
+
+Schema version 1 retains task order, approval/review revisions, explicit dependency edges, resource scopes, delivery evidence and pending question scopes. Validation rejects cycles, missing dependencies, invalid states, escaping paths and unsupported resource globs. `ready` excludes stale, unpublished, unsynchronized, blocked or undelivered-dependent tasks and respects active resource scopes and `max_parallel`. `impact` returns seed tasks and transitive dependents; shared-contract effects still require analysis. The results are advisory, not claims or atomic locks. A single coordinator must verify live platform state and the baseline before dispatching. Acceptance records require a user confirmation and delivery SHA; fields do not prove that approval occurred.
+
+Run `cargo test --test roadmaps` for offline filesystem, DAG, lifecycle and CLI coverage.
