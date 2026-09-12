@@ -34,6 +34,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage project milestones and Issue membership
+    #[command(subcommand)]
+    Milestone(MilestoneCommand),
     /// Show installed GitHub and GitLab support; does not inspect configuration or permissions
     Capabilities,
     /// Read and maintain native parent/child relationships
@@ -77,6 +80,47 @@ enum Command {
     /// Deprecated compatibility alias for delivery and configuration validation
     #[command(subcommand, hide = true)]
     Workflow(DeliveryCommand),
+}
+
+#[derive(Subcommand)]
+enum MilestoneCommand {
+    List,
+    Show {
+        id: u64,
+    },
+    Create {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Update {
+        id: u64,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        expected_file: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
+    Bind {
+        id: u64,
+        #[arg(long)]
+        issue: u64,
+        #[arg(long)]
+        apply: bool,
+    },
+    Close {
+        id: u64,
+        #[arg(long)]
+        expected_file: PathBuf,
+        #[arg(long)]
+        accepted_ref: String,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +285,7 @@ fn capabilities() -> Value {
         "platforms": {
             "github": {
                 "issues": "supported",
+                "milestones": "project-level",
                 "sub_issues": "supported",
                 "dependencies": "supported",
                 "pull_requests": "supported",
@@ -249,6 +294,7 @@ fn capabilities() -> Value {
             },
             "gitlab": {
                 "issues": "supported",
+                "milestones": "project-level",
                 "sub_issues": "same-project Issue to Task",
                 "dependencies": "supported",
                 "merge_requests": "same-project",
@@ -597,6 +643,45 @@ fn input<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
 }
 
 async fn execute(command: Command, config: Config) -> Result<Value> {
+    if let Command::Milestone(command) = command {
+        let target = Target::defaults(&config)?;
+        let transport = SdkTransport::new(&config, target.platform)?;
+        let service = issueflow::milestone::Milestones {
+            transport: &transport,
+            target,
+        };
+        return match command {
+            MilestoneCommand::List => service.list().await,
+            MilestoneCommand::Show { id } => service.show(id).await,
+            MilestoneCommand::Create {
+                file,
+                request_id,
+                apply,
+            } => service.create(input(&file)?, &request_id, apply).await,
+            MilestoneCommand::Update {
+                id,
+                file,
+                expected_file,
+                apply,
+            } => {
+                service
+                    .update(id, input(&file)?, &input::<Value>(&expected_file)?, apply)
+                    .await
+            }
+            MilestoneCommand::Bind { id, issue, apply } => service.bind(id, issue, apply).await,
+            MilestoneCommand::Close {
+                id,
+                expected_file,
+                accepted_ref,
+                apply,
+            } => {
+                service
+                    .close(id, &input::<Value>(&expected_file)?, &accepted_ref, apply)
+                    .await
+            }
+        };
+    }
+
     if matches!(command, Command::SetupLabels) {
         eprintln!("warning: `setup-labels` is deprecated; use `kanban init` instead");
     }

@@ -454,3 +454,20 @@ issueflow --no-env-file kanban repositories PROJECT_URL
 ```
 
 The link makes the Project accessible from the repository's Projects entry. It is separate from adding an issue to a Project and from recording `github_project_url` locally. Existing links are reused without mutation; other repository links are preserved. Both commands paginate links. Linking reads back the association and reports unknown outcomes without retrying mutations. A failed link does not undo successful Project creation: inspect and resume using the existing Project URL. Project creation remains an explicit owner-scoped operation. The API is documented in [GitHub's Projects reference](https://docs.github.com/en/graphql/reference/projects#linkprojectv2torepository).
+
+## Project Milestones
+
+`milestone list/show/create/update/bind/close` uses the existing configured platform, repository, credentials and SDK transport. GitHub identifiers are milestone numbers; GitLab identifiers are project milestone global IDs. `bind --issue` uses the repository-local Issue number/iid.
+
+```sh
+issueflow --platform github --repository OWNER/REPO milestone list
+issueflow --json --platform github --repository OWNER/REPO milestone show 3 > before.json
+issueflow --platform github --repository OWNER/REPO milestone create --file milestone.json --request-id UUID --apply
+issueflow --platform github --repository OWNER/REPO milestone update 3 --file milestone.json --expected-file before.json --apply
+issueflow --platform github --repository OWNER/REPO milestone bind 3 --issue 42 --apply
+issueflow --platform github --repository OWNER/REPO milestone close 3 --expected-file before.json --accepted-ref acceptance.md --apply
+```
+
+Milestone mutations preview without `--apply`. Input JSON accepts only `title` and `description`; creation requires a nonempty title. Update/close compare the latest editable fields and identity against the raw `--json milestone show` snapshot in `--expected-file`. This is an optimistic check, not an atomic server lock. Writes are read back; readback failures are reported as unknown outcomes.
+
+Create persists a UUID marker for recovery and reuses a unique match. After an unknown create, query the marker before any retry; absence is not proof that creation failed. Do not change UUID to bypass uncertain results. Bind rejects existing membership in a different milestone. Closing requires a reference to actual user acceptance; the argument itself does not grant approval. Group milestones are not supported.
